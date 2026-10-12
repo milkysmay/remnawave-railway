@@ -1,0 +1,2393 @@
+package tun
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"math/rand"
+	"net"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/strategy"
+)
+
+// isTemporaryError checks if error is EAGAIN/EWOULDBLOCK (non-blocking fd)
+func isTemporaryError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check for syscall.EAGAIN
+	if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+		return true
+	}
+	// Also check error message for "resource temporarily unavailable"
+	errStr := err.Error()
+	return strings.Contains(errStr, "resource temporarily unavailable") ||
+		strings.Contains(errStr, "would block")
+}
+
+// Keepalive packet marker (zero-length packet signals keepalive)
+const keepaliveInterval = 10 * time.Second
+const readTimeout = 30 * time.Second           // Must be > keepaliveInterval, detect dead connection faster
+const writeTimeout = 30 * time.Second          // Write timeout (was 5s, caused i/o timeouts with bufferbloat)
+const deadConnectionTimeout = 45 * time.Second // Proactive dead connection detection timeout
+
+// maxFrameLen is the largest [len:4][data:N] payload the tunnel protocol accepts;
+// anything above it is treated as a desynced stream and drops the connection.
+const maxFrameLen = 65535
+
+// Reconnect configuration
+const (
+	reconnectInitialDelay = 1 * time.Second // Start with 1 second
+	reconnectMaxDelay     = 2 * time.Minute // Cap at 2 minutes
+	reconnectMultiplier   = 2.0             // Double each time
+	reconnectJitterFactor = 0.3             // +/- 30% jitter
+)
+
+// Port hop reconnect configuration (faster than regular reconnect)
+const (
+	portHopReconnectTimeout = 5 * time.Second // Quick timeout for port hop
+	portHopMaxAttempts      = 3               // Max attempts before falling back to regular reconnect
+)
+
+// VPNClient manages the TUN-based VPN connection
+// tunHandshakeVersion is the default TUN handshake version byte sent by this
+// client. v3 is additive over v2 (full port-hop config) and additionally
+// advertises that the client understands the auto-MTU active probe. Older
+// servers treat >=0x02 identically, so the bump is backward-compatible.
+const tunHandshakeVersion = 0x03
+
+// tunHandshakeVersionDualStack advertises IPv6 dual-stack support inside the
+// tunnel. Sent only when the client is built with dual-stack enabled
+// (VPNConfig.DualStack); the request format is unchanged, so old servers
+// ReadFull the same 8 bytes and simply ignore the unknown version.
+const tunHandshakeVersionDualStack = 0x04
+
+// DualStackCapFlag is the handshake-response flag bit (resp[9]) by which an
+// exit advertises IPv6 dual-stack inside the tunnel. When set, the response
+// carries a trailing 32-byte block [serverIP6:16][clientIP6:16] after the
+// version-dependent layout.
+const DualStackCapFlag = 0x04
+
+// Handshake-response flag bits (resp[9]).
+const (
+	tunFlagPortHopping = 0x01             // server advertises port hopping
+	tunFlagMTUProbe    = ProbeCapFlag     // server supports the auto-MTU echo (exit only)
+	tunFlagDualStack   = DualStackCapFlag // server assigned IPv6 tunnel addresses
+)
+
+// ServerCapabilities contains optional features advertised by server
+type ServerCapabilities struct {
+	PortHoppingEnabled bool
+	PortRangeStart     int
+	PortRangeEnd       int
+	HopIntervalSec     int    // Hop interval in seconds (0 = use default 60s)
+	HopStrategy        string // "random", "sequential", "fibonacci" (empty = "random")
+	HopSeed            []byte // Optional seed for deterministic hopping
+	MTUProbeSupported  bool   // exit echoes auto-MTU probe frames
+
+	// DualStackEnabled reports that the exit assigned IPv6 tunnel addresses
+	// (server answered a v0x04 handshake with the dual-stack flag and the
+	// trailing 32-byte address block).
+	DualStackEnabled bool
+	ServerIP6        net.IP // exit's IPv6 tunnel address (16 bytes)
+	ClientIP6        net.IP // assigned client IPv6 tunnel address (16 bytes)
+}
+
+type VPNClient struct {
+	tun        *TUNDevice
+	manager    *strategy.Manager
+	serverAddr string
+	localIP    net.IP
+	conn       net.Conn
+	strategy   strategy.Strategy
+
+	// Stats
+	packetsUp   int64
+	packetsDown int64
+	bytesUp     int64
+	bytesDown   int64
+
+	// Lifecycle counters for observability (accessed atomically). Polled by the
+	// client's metrics syncer and surfaced as reconnects_total / connections_total
+	// — previously these Prometheus counters were always zero in TUN mode because
+	// nothing fed them.
+	tunnelConnects int64 // successful tunnel establishments (initial + reconnects)
+	reconnectsOK   int64 // reconnect attempts that re-established the tunnel
+	reconnectsFail int64 // reconnect attempts that failed and backed off
+
+	// Control
+	running      int32
+	reconnecting int32 // Prevents concurrent reconnect attempts
+	stopCh       chan struct{}
+	mu           sync.Mutex
+	lastActive   time.Time // Track last activity for keepalive
+
+	// connCancel cancels the context of an in-flight connect() so Stop() can
+	// abort a dial/handshake that is blocked on the network without waiting
+	// for v.mu (connect no longer holds v.mu while dialing). Accessed atomically.
+	connCancel atomic.Pointer[context.CancelFunc]
+
+	// Server capabilities (received during handshake)
+	serverCaps ServerCapabilities
+
+	// ipv6Policy is what the client does with IPv6 for the life of this
+	// tunnel: negotiate it into the tunnel (handshake version 0x04), block it
+	// when the tunnel cannot carry it, or leave the host alone. Resolved from
+	// VPNConfig by VPNConfig.ipv6PolicyOrLegacy.
+	ipv6Policy IPv6Policy
+	// Auto-MTU active probe state.
+	autoMTU       bool                   // -auto-mtu enabled
+	ownsInterface bool                   // we created the TUN (can change MTU live)
+	prober        atomic.Pointer[Prober] // current prober (replies routed here)
+	lastProbeMu   sync.Mutex
+	lastProbe     ProbeResult
+	lastProbeOK   bool
+
+	// Port hop state for seamless reconnect
+	portHopInProgress int32    // 1 if port hop reconnect in progress
+	pendingConn       net.Conn // New connection being established during port hop
+	pendingStrategy   strategy.Strategy
+}
+
+// VPNConfig configures the VPN client
+type VPNConfig struct {
+	TunName    string   // TUN device name (e.g., "tiredvpn0")
+	MTU        int      // MTU size (default 1280)
+	LocalIP    net.IP   // Local TUN IP (e.g., 10.8.0.2)
+	RemoteIP   net.IP   // Server TUN IP (e.g., 10.8.0.1)
+	Routes     []string // Routes to add (e.g., "0.0.0.0/0")
+	ServerAddr string   // Server address (host:port)
+	Manager    *strategy.Manager
+
+	// ServerAddrV6 is the server's IPv6 transport address ("[2001:db8::1]:995",
+	// from -server-v6). The strategy manager may dial it instead of ServerAddr
+	// when -prefer-ipv6 is on, and the v6 half-default routes installed by a
+	// negotiated dual-stack tunnel would then swallow the client's own
+	// transport socket. Recorded so the TUN can pin a /128 bypass for it.
+	ServerAddrV6 string
+
+	// ServerAddrs is every transport address of every configured endpoint, in
+	// "host:port" form; ServerAddr and ServerAddrV6 are the first endpoint's
+	// and appear here too.
+	//
+	// A full tunnel needs a host route for each of them: with a single bypass
+	// pinned, dialling a second server sends the transport socket into the
+	// tunnel it is supposed to carry, and it dies there. Every entry is pinned
+	// at start-up rather than at the moment of a switch, so there is no window
+	// where the client has moved and the route has not.
+	//
+	// Empty means "just ServerAddr / ServerAddrV6", which is what every
+	// single-server caller (macOS, JNI, benchmarks) keeps passing.
+	ServerAddrs []string
+
+	// AutoMTU enables the active MTU probe. When set, MTU becomes the upper bound
+	// (cap) and the client measures the real end-to-end ceiling, applying
+	// min(probed, cap). Only effective on interfaces we own (non-fd Linux/macOS).
+	AutoMTU bool
+
+	// IPv6Policy selects what happens to IPv6 while the tunnel is up:
+	// IPv6PolicyDual (the -tun-ipv6 default) asks the exit for IPv6 tunnel
+	// addresses with handshake version 0x04 instead of 0x03 and blocks
+	// outbound IPv6 if it declines; IPv6PolicyBlock blocks without asking;
+	// IPv6PolicyOff is the historical v4-only tunnel with host IPv6 untouched.
+	// The handshake request format is identical either way, so asking is safe
+	// against old exits — they ignore the unknown version.
+	IPv6Policy IPv6Policy
+
+	// IPv6Allow is the parsed -tun-ipv6-allow list: interfaces and destination
+	// prefixes the leak block must not touch. It exists because the block is a
+	// host-wide reject and the host may carry IPv6 the client knows nothing
+	// about — a 6in4 tunnel, another VPN, a routed prefix. Empty by default,
+	// which is the block as it shipped.
+	IPv6Allow IPv6AllowList
+
+	// IPv6Routes is the parsed -tun-routes6 spec: which IPv6 destinations the
+	// tunnel claims once dual-stack is negotiated. The zero value is the
+	// ::/1 + 8000::/1 half-defaults, i.e. the full tunnel issue #55 asks for.
+	// Setting it hands IPv6 routing policy back to the operator, which also
+	// takes the blanket leak block out of play — see IPv6RouteSpec.
+	IPv6Routes IPv6RouteSpec
+
+	// DualStack is the pre-policy spelling of IPv6Policy == IPv6PolicyDual,
+	// kept for callers that have not moved over (macOS, benchmarks). Ignored
+	// when IPv6Policy is set to anything but its zero value.
+	//
+	// Deprecated: set IPv6Policy instead.
+	DualStack bool
+
+	// Android VpnService support
+	TunFd       int    // Use existing TUN file descriptor (from VpnService.establish())
+	ProtectPath string // Unix socket path for VpnService.protect() calls
+}
+
+// serverAddrList returns every configured transport address, most preferred
+// first and deduplicated: -server-v6, -server, then the rest of the endpoint
+// list. The first two lead so a single-server client keeps the exact ordering
+// it had before the list existed.
+func serverAddrList(cfg VPNConfig) []string {
+	out := make([]string, 0, 2+len(cfg.ServerAddrs))
+	seen := make(map[string]bool, 2+len(cfg.ServerAddrs))
+	for _, addr := range append([]string{cfg.ServerAddrV6, cfg.ServerAddr}, cfg.ServerAddrs...) {
+		if addr == "" || seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		out = append(out, addr)
+	}
+	return out
+}
+
+// serverIP6s lists every IPv6 transport address this client might dial, in
+// preference order. serverBypassIP6 pins a route for the first one; the IPv6
+// leak block has to punch a hole for all of them, since the client can switch
+// between them across reconnects and a hole for an address that is never
+// dialled costs nothing.
+func serverIP6s(cfg VPNConfig) []net.IP {
+	var out []net.IP
+	for _, addr := range serverAddrList(cfg) {
+		for _, ip := range resolveBypassIPs(addr) {
+			// A v4-mapped literal (::ffff:1.2.3.4) is an IPv4 address wearing
+			// v6 syntax: the kernel has no v6 route for that form, and the v4
+			// bypass already covers the host.
+			if ip.To4() != nil || containsIP(out, ip) {
+				continue
+			}
+			out = append(out, ip)
+		}
+	}
+	return out
+}
+
+// serverBypassIPs lists every address a host route has to be pinned for: one
+// per configured endpoint, both families.
+//
+// A hostname contributes ALL of its records, not just the first. The dialer is
+// free to pick any of them, and a /32 to an address that is never dialled costs
+// one routing-table entry - whereas missing the one that IS dialled costs the
+// tunnel.
+func serverBypassIPs(cfg VPNConfig) []net.IP {
+	var out []net.IP
+	for _, addr := range serverAddrList(cfg) {
+		for _, ip := range resolveBypassIPs(addr) {
+			if containsIP(out, ip) {
+				continue
+			}
+			out = append(out, ip)
+		}
+	}
+	return out
+}
+
+// resolveBypassIPs turns one "host:port" address into every IP behind it. An
+// address literal resolves to itself; a hostname to all of its A and AAAA
+// records. An unresolvable host yields nothing and is simply skipped, which is
+// the pre-existing behaviour for a bypass that cannot be computed.
+func resolveBypassIPs(serverAddr string) []net.IP {
+	if serverAddr == "" {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(serverAddr)
+	if err != nil {
+		host = serverAddr
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return []net.IP{ip}
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil
+	}
+	return ips
+}
+
+func containsIP(list []net.IP, ip net.IP) bool {
+	for _, existing := range list {
+		if existing.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// ipv6PolicyOrLegacy resolves the effective policy: IPv6Policy when set,
+// otherwise the deprecated DualStack bool.
+func (cfg VPNConfig) ipv6PolicyOrLegacy() IPv6Policy {
+	if cfg.IPv6Policy != IPv6PolicyOff {
+		return cfg.IPv6Policy
+	}
+	if cfg.DualStack {
+		return IPv6PolicyDual
+	}
+	return IPv6PolicyOff
+}
+
+// applyIPv6BlockConfig records everything the leak block is built from onto a
+// device we own: the policy that decides whether it goes in at all, the holes
+// for the client's own exits, and the operator's exceptions.
+//
+// Extracted from NewVPNClient because that function needs a real TUN and root,
+// while this is three field writes — and the interesting failure is a config
+// field that never reaches the device, which is exactly what a test of
+// NewVPNClient cannot check and a test of this can.
+func applyIPv6BlockConfig(dev *TUNDevice, cfg VPNConfig) {
+	dev.SetIPv6Policy(cfg.ipv6PolicyOrLegacy())
+	// The client's own transport addresses, one layer below the /128 bypass
+	// routes: the block rejects outbound v6, and the dial to an exit reached
+	// over IPv6 must not be caught by it.
+	dev.SetIPv6BlockAllow(serverIP6s(cfg))
+	dev.SetIPv6BlockAllowList(cfg.IPv6Allow)
+	// The route spec belongs here rather than next to Configure: it decides
+	// what EnableDualStack installs *and* whether the block applies at all, so
+	// it has to be on the device before either is consulted.
+	dev.SetIPv6Routes(cfg.IPv6Routes)
+}
+
+// NewVPNClient creates a new VPN client
+func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
+	if cfg.MTU == 0 {
+		cfg.MTU = DefaultMTU
+	}
+	if cfg.TunName == "" {
+		cfg.TunName = "tiredvpn0"
+	}
+	if cfg.LocalIP == nil {
+		cfg.LocalIP = net.ParseIP("10.8.0.2")
+	}
+	if cfg.RemoteIP == nil {
+		cfg.RemoteIP = net.ParseIP("10.8.0.1")
+	}
+
+	// Initialize Android socket protector if path is provided
+	if cfg.ProtectPath != "" {
+		if err := InitAndroidProtector(cfg.ProtectPath); err != nil {
+			return nil, err
+		}
+	}
+
+	var tunDev *TUNDevice
+	var err error
+
+	// Use existing TUN fd if provided (Android VpnService mode)
+	if cfg.TunFd > 0 {
+		log.Info("Using existing TUN fd=%d (Android VpnService mode)", cfg.TunFd)
+		tunDev, err = CreateTUNFromFd(cfg.TunFd, cfg.TunName, cfg.MTU)
+		if err != nil {
+			return nil, err
+		}
+		// Configure from fd (skip system config, VpnService handles it)
+		if err := tunDev.ConfigureFromFd(cfg.LocalIP, cfg.RemoteIP); err != nil {
+			tunDev.Close()
+			return nil, err
+		}
+	} else {
+		// Create new TUN device (normal Linux mode)
+		tunDev, err = CreateTUN(cfg.TunName, cfg.MTU)
+		if err != nil {
+			return nil, err
+		}
+		// Record the IPv6 policy before Configure: it keeps IPv6 enabled on
+		// the interface for the post-handshake EnableDualStack, and decides
+		// whether outbound IPv6 gets blocked once the tunnel's IPv6 fate is
+		// known. Only on interfaces we own — the fd branch above leaves the
+		// device at IPv6PolicyOff, because on Android VpnService owns both
+		// routing and filtering.
+		applyIPv6BlockConfig(tunDev, cfg)
+		// Pin a bypass route for EVERY configured endpoint before configuring
+		// routes, so a full-tunnel default route does not loop the client's own
+		// server traffic - not for the current endpoint alone, because by the
+		// time the client decides to try the second one the tunnel is already
+		// up and the unpinned dial goes into it.
+		//
+		// This covers both families for the same reason it always did on the v6
+		// side: once dual-stack is negotiated the ::/1 + 8000::/1 half-defaults
+		// cover every IPv6 destination, the client's own servers among them.
+		if bypassIPs := serverBypassIPs(cfg); len(bypassIPs) > 0 {
+			tunDev.SetServerBypassIPs(bypassIPs)
+			log.Debug("Server bypass: %d endpoint address(es) will be pinned", len(bypassIPs))
+		}
+		// Defer route installation (notably the 0.0.0.0/0 default route) until a
+		// real connection + handshake to the server succeeds. Configure brings
+		// the interface up and assigns its address, but leaves the host's normal
+		// routing intact so an unreachable server cannot strand the machine
+		// offline. Routes go in via InstallRoutes from Start() after connect.
+		tunDev.SetDeferRoutes(true)
+		// Configure TUN device
+		if err := tunDev.Configure(cfg.LocalIP, cfg.RemoteIP, cfg.Routes); err != nil {
+			tunDev.Close()
+			return nil, err
+		}
+	}
+
+	return &VPNClient{
+		tun:           tunDev,
+		manager:       cfg.Manager,
+		serverAddr:    cfg.ServerAddr,
+		localIP:       cfg.LocalIP,
+		stopCh:        make(chan struct{}),
+		autoMTU:       cfg.AutoMTU,
+		ownsInterface: cfg.TunFd <= 0,
+		ipv6Policy:    cfg.ipv6PolicyOrLegacy(),
+	}, nil
+}
+
+// handshakeVersion returns the TUN handshake version byte this client sends:
+// 0x04 when the policy negotiates dual-stack, else the default 0x03. The
+// request layout is identical either way, so this is the only on-wire
+// difference the IPv6 policy makes. -tun-ipv6=block keeps 0x03: it wants the
+// host's IPv6 stopped, not carried, so there is nothing to ask the exit for.
+func (v *VPNClient) handshakeVersion() byte {
+	if v.ipv6Policy.NegotiatesDualStack() {
+		return tunHandshakeVersionDualStack
+	}
+	return tunHandshakeVersion
+}
+
+// Start starts the VPN tunnel
+func (v *VPNClient) Start(ctx context.Context) error {
+	if !atomic.CompareAndSwapInt32(&v.running, 0, 1) {
+		return nil // Already running
+	}
+
+	// Wire the physical-route signals between the TUN and the strategy manager
+	// BEFORE the first connect. Two directions, one truth:
+	//   - the family preflight asks HasPhysicalRoute so the very first scan skips
+	//     a family this host cannot reach (IPv6 endpoints with no IPv6 on the
+	//     line) instead of timing out on it;
+	//   - the bypass watcher reports when an address loses or regains its
+	//     physical route, so a family that dies mid-session is excluded from the
+	//     next reconnect and re-admitted once the route is back.
+	// Only for interfaces we own — on Android VpnService owns routing and the
+	// TUN methods are no-ops there.
+	if v.ownsInterface && v.manager != nil {
+		tunDev, mgr := v.tun, v.manager
+		mgr.SetRouteReachable(func(addr string) (routable, known bool) {
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				host = addr
+			}
+			ip := net.ParseIP(host)
+			if ip == nil {
+				return false, false
+			}
+			return tunDev.HasPhysicalRoute(ip)
+		})
+		tunDev.SetBypassUnroutableFunc(func(ip net.IP, unroutable bool) {
+			mgr.SetEndpointReachableIP(ip, !unroutable)
+		})
+	}
+
+	// Connect to server
+	if err := v.connect(ctx); err != nil {
+		atomic.StoreInt32(&v.running, 0)
+		return err
+	}
+
+	// Connection + handshake succeeded. Only now point routes (incl. the
+	// default route) at the tunnel. If connect had failed, routes were never
+	// installed and the host kept its normal routing, staying online while the
+	// background reconnect loop retries.
+	v.tun.InstallRoutes()
+
+	// Initialize last activity time
+	v.mu.Lock()
+	v.lastActive = time.Now()
+	v.mu.Unlock()
+
+	// Subscribe to port hop events from strategy manager
+	// This ensures VPN reconnects when port hopping changes the server port
+	// Uses seamless "make before break" approach to minimize downtime
+	if v.manager != nil {
+		v.manager.SetPortHopCallback(func(oldPort, newPort int) {
+			log.Info("VPN: port hop detected (%d -> %d), initiating seamless reconnect", oldPort, newPort)
+			go v.seamlessPortHop(newPort)
+		})
+	}
+
+	// Keep the server reachable off-tunnel for as long as the tunnel lives. The
+	// bypass route sits on the physical link, so anything that takes that link
+	// down (Wi-Fi reassociation, dock, suspend) makes the kernel drop it and the
+	// client starts dialling its own server through its own tunnel. Only for
+	// interfaces we own — on Android the socket is protected by VpnService.
+	if v.ownsInterface {
+		go v.tun.WatchServerBypass(v.stopCh)
+	}
+
+	// Start packet forwarding
+	go v.readFromTun()
+	go v.readFromServer()
+	go v.sendKeepalive()
+
+	// Auto-MTU: measure the real end-to-end ceiling and apply min(probed, cap).
+	// readFromServer is already running so PROBE_REPLY frames can be routed to the
+	// prober. Runs in the background so connectivity is never blocked beyond the
+	// fast-probe deadline.
+	v.maybeStartMTUProbe(ctx, "connect")
+
+	log.Info("VPN tunnel started")
+	return nil
+}
+
+// maybeStartMTUProbe launches the active MTU probe when enabled, supported by the
+// exit, and the interface MTU can be changed live (interfaces we created). It is a
+// no-op otherwise, leaving the statically negotiated MTU in place.
+func (v *VPNClient) maybeStartMTUProbe(ctx context.Context, trigger string) {
+	if !v.autoMTU {
+		return
+	}
+	if !v.serverCaps.MTUProbeSupported {
+		log.Info("Auto-MTU: exit did not advertise probe support, keeping static MTU %d (reason=no-capability)", v.tun.mtu)
+		v.storeProbeResult(ProbeResult{AppliedMTU: v.tun.mtu, Source: "cap", FallbackReason: "no-capability"})
+		return
+	}
+	if !v.ownsInterface {
+		// Host-owned fd (Android VpnService / macOS NE): the MTU can only be set at
+		// establish() time by the host, so a live probe-and-raise is not possible
+		// here. The host should probe before establish (out of scope for Go core).
+		// TODO: expose a probe-before-establish entry point for host integrations.
+		log.Debug("Auto-MTU: interface is host-owned (fd mode), skipping live probe")
+		return
+	}
+	go v.runMTUProbe(ctx, trigger)
+}
+
+// runMTUProbe performs the connect-time fast probe and, on failure, lowers the
+// interface to the floor and refines in the background. See
+// research/auto-mtu-design-2026-06-28.md section 4.4.
+func (v *VPNClient) runMTUProbe(ctx context.Context, trigger string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("runMTUProbe panic: %v", r)
+		}
+	}()
+
+	capMTU := v.tun.mtu
+	if capMTU < MTUFloor {
+		// Configured below the floor: nothing to measure, the floor is the ceiling.
+		log.Debug("Auto-MTU: configured MTU %d <= floor, skipping probe", capMTU)
+		return
+	}
+
+	// Per-probe timeout from the measured RTT (>= 500ms floor).
+	timeout := minProbeTimeout
+	if v.manager != nil {
+		if rtt := v.manager.GetLastConnectionInfo().Latency; rtt > 0 {
+			if t := 3 * rtt; t > timeout {
+				timeout = t
+			}
+		}
+	}
+
+	prober := NewProber(ProbeConfig{
+		Floor:   MTUFloor,
+		Cap:     capMTU,
+		Step:    defaultProbeStep,
+		Timeout: timeout,
+		Retries: defaultProbeRetries,
+	}, v.sendProbeFrame)
+	v.prober.Store(prober)
+	defer v.prober.Store(nil)
+
+	start := time.Now()
+
+	// Fast synchronous probe of cap: the common 1500-path case answers in ~1 RTT
+	// and we keep the tunnel at full MTU.
+	if prober.FastProbe(ctx, fastProbeDeadline) {
+		v.applyProbedMTU(capMTU)
+		res := ProbeResult{AppliedMTU: capMTU, Source: "cap", Probes: prober.Probes(), DurationMs: time.Since(start).Milliseconds()}
+		v.storeProbeResult(res)
+		log.Info("Auto-MTU[%s]: cap %d confirmed via fast probe in %dms (%d probes)", trigger, capMTU, res.DurationMs, res.Probes)
+		return
+	}
+
+	// Fast probe failed: drop to the conservative floor immediately (safe, see 5.2)
+	// so oversized frames cannot black-hole, then refine the real ceiling and raise.
+	log.Info("Auto-MTU[%s]: fast probe of cap %d failed, lowering to floor %d and refining in background", trigger, capMTU, MTUFloor)
+	v.applyProbedMTU(MTUFloor)
+
+	res := prober.Run(ctx)
+	v.applyProbedMTU(res.AppliedMTU)
+	v.storeProbeResult(res)
+	log.Info("Auto-MTU[%s]: probed=%d source=%s probes=%d duration=%dms fallback=%q",
+		trigger, res.AppliedMTU, res.Source, res.Probes, res.DurationMs, res.FallbackReason)
+}
+
+// sendProbeFrame frames a probe control payload as [len:4][payload] and writes it
+// to the current server connection.
+func (v *VPNClient) sendProbeFrame(payload []byte) error {
+	frame := make([]byte, 4+len(payload))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
+	copy(frame[4:], payload)
+
+	v.mu.Lock()
+	conn := v.conn
+	v.mu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("no server connection")
+	}
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_, err := conn.Write(frame)
+	return err
+}
+
+// applyProbedMTU sets the live interface MTU to min(max(mtu, floor), cap). It is a
+// no-op when the value is unchanged.
+func (v *VPNClient) applyProbedMTU(mtu int) {
+	if mtu < MTUFloor {
+		mtu = MTUFloor
+	}
+	if mtu > v.tun.mtu {
+		mtu = v.tun.mtu
+	}
+	if mtu == v.tun.MTU() {
+		return
+	}
+	if err := v.tun.SetMTU(mtu); err != nil {
+		log.Warn("Auto-MTU: failed to apply MTU %d: %v", mtu, err)
+	}
+}
+
+func (v *VPNClient) storeProbeResult(res ProbeResult) {
+	v.lastProbeMu.Lock()
+	v.lastProbe = res
+	v.lastProbeOK = true
+	v.lastProbeMu.Unlock()
+}
+
+// LastMTUProbe returns the most recent probe result and whether one has completed.
+func (v *VPNClient) LastMTUProbe() (ProbeResult, bool) {
+	v.lastProbeMu.Lock()
+	defer v.lastProbeMu.Unlock()
+	return v.lastProbe, v.lastProbeOK
+}
+
+// ForceReconnect forces an immediate VPN reconnect
+// Used when port hopping changes the server port
+func (v *VPNClient) ForceReconnect() {
+	if atomic.LoadInt32(&v.running) == 0 {
+		return
+	}
+
+	// Close current connection to trigger reconnect in readFromServer/readFromTun
+	v.mu.Lock()
+	if v.conn != nil {
+		v.conn.Close()
+		v.conn = nil
+	}
+	v.mu.Unlock()
+
+	// Reset reconnecting flag to allow handleDisconnect to proceed
+	atomic.StoreInt32(&v.reconnecting, 0)
+
+	log.Debug("VPN: ForceReconnect - connection closed, reconnect will be triggered")
+}
+
+// seamlessPortHop performs "make before break" port hop
+// Establishes new connection first, then atomically swaps, minimizing downtime
+func (v *VPNClient) seamlessPortHop(newPort int) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("seamlessPortHop panic: %v", r)
+			atomic.StoreInt32(&v.portHopInProgress, 0)
+			v.handleDisconnect()
+		}
+	}()
+
+	// Prevent concurrent port hops
+	if !atomic.CompareAndSwapInt32(&v.portHopInProgress, 0, 1) {
+		log.Debug("VPN: port hop already in progress, skipping")
+		return
+	}
+	defer atomic.StoreInt32(&v.portHopInProgress, 0)
+
+	start := time.Now()
+	log.Debug("VPN: starting seamless port hop to port %d", newPort)
+
+	// Get server host from current address
+	host, _, err := net.SplitHostPort(v.serverAddr)
+	if err != nil {
+		host = v.serverAddr
+	}
+	newTarget := net.JoinHostPort(host, strconv.Itoa(newPort))
+
+	// Try to establish new connection (make)
+	var newConn net.Conn
+	var newStrategy strategy.Strategy
+	var connectErr error
+
+	for attempt := 1; attempt <= portHopMaxAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), portHopReconnectTimeout)
+
+		// Connect to new port using strategy manager
+		newConn, newStrategy, connectErr = v.manager.Connect(ctx, newTarget)
+		cancel()
+
+		if connectErr == nil {
+			break
+		}
+
+		log.Debug("VPN: port hop connect attempt %d/%d failed: %v", attempt, portHopMaxAttempts, connectErr)
+
+		if attempt < portHopMaxAttempts {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	if connectErr != nil {
+		log.Warn("VPN: seamless port hop failed after %d attempts, falling back to force reconnect", portHopMaxAttempts)
+		v.ForceReconnect()
+		return
+	}
+
+	// Perform TUN mode handshake on new connection
+	tunnelConn, handshakeErr := v.performHandshake(newConn)
+	if handshakeErr != nil {
+		newConn.Close()
+		log.Warn("VPN: port hop handshake failed: %v, falling back to force reconnect", handshakeErr)
+		v.ForceReconnect()
+		return
+	}
+
+	// Atomic swap: new connection ready, swap with old (break)
+	v.mu.Lock()
+	oldConn := v.conn
+	v.conn = tunnelConn
+	v.strategy = newStrategy
+	v.serverAddr = newTarget
+	v.lastActive = time.Now()
+	v.mu.Unlock()
+
+	// Close old connection after swap
+	if oldConn != nil {
+		oldConn.Close()
+	}
+
+	elapsed := time.Since(start)
+	log.Info("VPN: seamless port hop complete in %v (port %d, strategy %s)", elapsed, newPort, newStrategy.Name())
+}
+
+// performHandshake performs TUN mode handshake on a connection
+// Used by seamlessPortHop to setup new connection before swapping
+//
+// It returns the conn to install: the handshake reader may hand back the start
+// of the first tunnel frame through a wrapper (see readHandshakeResponse).
+func (v *VPNClient) performHandshake(conn net.Conn) (net.Conn, error) {
+	// Send TUN mode handshake
+	// Format: [mode:1][localIP:4][mtu:2][version:1]
+	handshake := make([]byte, 8)
+	handshake[0] = 0x02 // TUN mode
+	copy(handshake[1:5], v.localIP.To4())
+	binary.BigEndian.PutUint16(handshake[5:7], uint16(v.tun.mtu))
+	handshake[7] = v.handshakeVersion() // v3: auto-MTU probe; v4: + dual-stack
+
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write(handshake); err != nil {
+		return nil, fmt.Errorf("handshake write failed: %w", err)
+	}
+
+	// Read server response (drains the dual-stack block when advertised, so
+	// the stream stays frame-aligned for the packet loop that follows).
+	resp, n, conn, err := readHandshakeResponse(conn, v.handshakeVersion(), time.Now().Add(5*time.Second))
+	if err != nil {
+		return nil, fmt.Errorf("handshake read failed: %w", err)
+	}
+	if n < 9 {
+		return nil, fmt.Errorf("invalid server response: got %d bytes", n)
+	}
+	if resp[0] != 0x00 {
+		return nil, fmt.Errorf("server error: status=%d", resp[0])
+	}
+
+	// Verify server assigned same IP (port hop should preserve IP)
+	assignedIP := net.IP(resp[5:9])
+	if !assignedIP.Equal(v.localIP) && !assignedIP.Equal(net.IPv4zero) {
+		log.Debug("VPN: port hop got different IP: %s (was %s)", assignedIP, v.localIP)
+		// Update if different
+		v.localIP = assignedIP
+		if err := v.tun.UpdateLocalIP(assignedIP); err != nil {
+			log.Warn("VPN: failed to update TUN local IP: %v", err)
+		}
+	}
+
+	log.Debug("VPN: port hop handshake successful")
+	return conn, nil
+}
+
+// connect establishes connection to server.
+//
+// The dial and handshake run WITHOUT holding v.mu so that Stop() can abort an
+// in-flight connect immediately (via connCancel + the conn deadline) instead of
+// blocking on the mutex until a 10-30s network timeout elapses. v.mu is taken
+// only briefly: at the start to snapshot localIP and close the old conn, and at
+// the end to publish the new conn/strategy/caps.
+func (v *VPNClient) connect(parent context.Context) error {
+	// Register a cancellable context so Stop() can abort the dial without v.mu.
+	ctx, cancel := context.WithCancel(parent)
+	cancelPtr := &cancel
+	v.connCancel.Store(cancelPtr)
+	defer func() {
+		// Only clear our own cancel pointer (Stop may have swapped/cancelled).
+		v.connCancel.CompareAndSwap(cancelPtr, nil)
+		cancel()
+	}()
+
+	// If Stop already fired, bail before opening anything.
+	if atomic.LoadInt32(&v.running) == 0 {
+		return context.Canceled
+	}
+
+	// Close any existing connection before dialing a new one.
+	v.mu.Lock()
+	oldConn := v.conn
+	v.conn = nil
+	localIP := v.localIP
+	v.mu.Unlock()
+	if oldConn != nil {
+		oldConn.Close()
+	}
+
+	// Connect via strategy manager (no lock held — may block on the network).
+	conn, strat, err := v.manager.Connect(ctx, v.serverAddr)
+	if err != nil {
+		return err
+	}
+
+	// Perform the TUN-mode handshake on local variables (still no lock).
+	resp, n, tunnelConn, err := v.doHandshake(conn, localIP)
+	if err != nil {
+		conn.Close()
+		return err
+	}
+	// From here on the tunnel is read through tunnelConn: the handshake reader
+	// may have had to look at the first byte of the first frame.
+	conn = tunnelConn
+
+	// Server sends its TUN IP and assigned client IP.
+	serverIP := net.IP(resp[1:5])
+	assignedIP := net.IP(resp[5:9])
+	log.Info("VPN connected via %s (server IP: %s, assigned IP: %s)", strat.Name(), serverIP, assignedIP)
+
+	// No raw-mode switch for the confusion transport any more. It existed
+	// because ConfusedConn's Read stripped a length prefix that the VPN layer
+	// then needed back, so the tunnel had to ask for a passthrough mode in
+	// which user packets reached the socket unencrypted. The sealed record
+	// layer replaced both halves: one framing, and no plaintext path to turn on.
+	caps, hasCaps := parseServerCapabilities(resp, n)
+
+	// Publish the new connection under the lock. If Stop() ran while we were
+	// dialing, abandon the freshly built conn instead of resurrecting the tunnel.
+	v.mu.Lock()
+	if atomic.LoadInt32(&v.running) == 0 {
+		v.mu.Unlock()
+		conn.Close()
+		return context.Canceled
+	}
+	v.conn = conn
+	v.strategy = strat
+	if hasCaps {
+		v.serverCaps = caps
+	}
+
+	// Update local IP if the server assigned a different one (mutates v.localIP
+	// and the TUN device, so it stays under the lock).
+	if !assignedIP.Equal(v.localIP) && !assignedIP.Equal(net.IPv4zero) {
+		log.Info("Server assigned IP: %s (requested: %s)", assignedIP, v.localIP)
+		v.localIP = assignedIP
+		if err := v.tun.UpdateLocalIP(assignedIP); err != nil {
+			log.Warn("Failed to update TUN local IP: %v", err)
+		}
+	}
+
+	// Update TUN peer IP if it changed.
+	if !serverIP.Equal(v.tun.remoteIP) {
+		log.Info("Updating TUN peer IP from %s to %s", v.tun.remoteIP, serverIP)
+		if err := v.tun.UpdatePeerIP(serverIP); err != nil {
+			log.Warn("Failed to update TUN peer IP: %v", err)
+		}
+	}
+	v.mu.Unlock()
+
+	// IPv6: bring up the v6 side of the tunnel only when the exit actually
+	// negotiated it. A declined negotiation (old server, no -ip-pool-v6)
+	// restores the exact v4-only interface state — no v6 address, no v6
+	// routes, disable_ipv6=1 — and then blocks outbound IPv6, so it neither
+	// blackholes nor escapes the tunnel. Host-owned interfaces (Android
+	// VpnService / macOS NE fd) are configured by the host, which consumes the
+	// negotiated addresses and owns its own filtering.
+	//
+	// Done here rather than at Configure time on purpose: routes are deferred
+	// until a connect succeeds, so until this point the host still relies on
+	// its own routing and cutting its IPv6 would take away connectivity the
+	// tunnel is not yet replacing.
+	switch ipv6ActionFor(v.ipv6Policy, v.ownsInterface, hasCaps && caps.DualStackEnabled) {
+	case ipv6ActionNone:
+		// Historical behavior: the tunnel is v4-only, host IPv6 untouched.
+	case ipv6ActionEnableDual:
+		if err := v.tun.EnableDualStack(caps.ClientIP6, caps.ServerIP6); err != nil {
+			log.Warn("Dual-stack: failed to configure IPv6 on the tunnel: %v (continuing IPv4-only)", err)
+			// DisableIPv6 restores the v4-only interface and, since the
+			// tunnel ends up not carrying IPv6, applies the leak block.
+			v.tun.DisableIPv6()
+		}
+	case ipv6ActionBlock:
+		if v.ipv6Policy == IPv6PolicyDual {
+			log.Warn("Dual-stack requested but the exit did not negotiate IPv6; " +
+				"continuing IPv4-only and blocking outbound IPv6 so it cannot leave outside the tunnel")
+			v.tun.DisableIPv6()
+			break
+		}
+		v.tun.ApplyIPv6LeakBlock()
+	}
+
+	// Mark the start of this session for storm detection. If the DPI tears the
+	// session down within seconds, handleDisconnect's RecordSessionEnd will see
+	// a short lifetime and (in auto mode) park this strategy. Called without
+	// v.mu held, after the conn is published.
+	if v.manager != nil {
+		v.manager.RecordSessionStart(strat.ID())
+	}
+
+	// Count every successful tunnel establishment (initial connect and every
+	// reconnect) so connections_total reflects reality in TUN mode.
+	atomic.AddInt64(&v.tunnelConnects, 1)
+
+	return nil
+}
+
+// doHandshake writes the TUN-mode handshake and reads the server response.
+// It runs without holding v.mu and returns the raw response buffer and its
+// length for the caller to parse, plus the conn the tunnel must be read from
+// afterwards (see readHandshakeResponse).
+func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, net.Conn, error) {
+	// Send TUN mode handshake.
+	// Format: [mode:1][localIP:4][mtu:2][version:1]
+	// If localIP is 0.0.0.0, server will auto-assign an IP.
+	// version=0x02 means client supports full port hopping config (interval, strategy, seed)
+	handshake := make([]byte, 8)
+	handshake[0] = 0x02 // TUN mode
+	copy(handshake[1:5], localIP.To4())
+	binary.BigEndian.PutUint16(handshake[5:7], uint16(v.tun.mtu))
+	handshake[7] = v.handshakeVersion() // v3: auto-MTU probe; v4: + dual-stack
+
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write(handshake); err != nil {
+		return nil, 0, nil, err
+	}
+
+	// Read server response.
+	// Legacy (9 bytes): [status:1][serverIP:4][clientIP:4]
+	// Extended v1 (14 bytes): [status:1][serverIP:4][clientIP:4][flags:1][portStart:2][portEnd:2]
+	// Extended v2 (20+ bytes): [status:1][serverIP:4][clientIP:4][flags:1][portStart:2][portEnd:2][hopInterval:4][strategy:1][seedLen:1][seed:0-32]
+	// Dual-stack (v4): the version-dependent layout followed by [serverIP6:16][clientIP6:16]
+	resp, n, conn, err := readHandshakeResponse(conn, v.handshakeVersion(), time.Now().Add(handshakeReadTimeout))
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	if n < 9 {
+		return nil, 0, nil, fmt.Errorf("invalid server response: got %d bytes, expected at least 9", n)
+	}
+	if resp[0] != 0x00 {
+		switch resp[0] {
+		case 0x01:
+			return nil, 0, nil, fmt.Errorf("server error: IP pool exhausted")
+		case 0x02:
+			return nil, 0, nil, fmt.Errorf("server error: no IP pool configured (auto IP not supported)")
+		default:
+			return nil, 0, nil, fmt.Errorf("server error: status=%d", resp[0])
+		}
+	}
+	return resp, n, conn, nil
+}
+
+// handshakeRespBufSize fits the largest handshake response: the v2 layout
+// with a max-length seed (20+32) plus the 32-byte dual-stack block.
+const handshakeRespBufSize = 96
+
+// ReadTUNHandshakeResponse reads a TUN handshake response from conn and
+// returns the raw response bytes: the version-dependent base layout plus the
+// trailing 32-byte dual-stack block when the flags byte advertises it.
+// Exported for the multi-hop relay (internal/server), which must forward the
+// exit's response to the downstream client verbatim, and for the client's
+// reconnect path.
+//
+// clientVersion is the handshake version byte that was sent to the exit (the
+// relay forwards its client's byte verbatim, so it knows it too): it decides
+// whether a flags byte follows the 9-byte prefix. deadline bounds the read of
+// the response (zero: handshakeReadTimeout from now); it is cleared again
+// before returning, so the returned conn carries no read deadline. The
+// returned conn is the one to keep reading from; see readHandshakeResponse
+// for why it can differ.
+func ReadTUNHandshakeResponse(conn net.Conn, clientVersion byte, deadline time.Time) ([]byte, net.Conn, error) {
+	resp, n, next, err := readHandshakeResponse(conn, clientVersion, deadline)
+	if err != nil {
+		return nil, conn, err
+	}
+	return resp[:n], next, nil
+}
+
+// ParseTUNHandshakeCapabilities decodes the capabilities of a raw TUN
+// handshake response (as returned by ReadTUNHandshakeResponse), including the
+// dual-stack address block. Exported for the multi-hop relay, which sources
+// the downstream client's IPv6 tunnel addresses from the exit's response.
+func ParseTUNHandshakeCapabilities(resp []byte) (ServerCapabilities, bool) {
+	return parseServerCapabilities(resp, len(resp))
+}
+
+// handshakeReadTimeout is the default budget for reading a handshake
+// response, used when the caller has no deadline of its own. A var so tests
+// can shorten it.
+var handshakeReadTimeout = 10 * time.Second
+
+// handshakeFlagsGrace bounds the wait for the byte after the 9-byte prefix of
+// a success response to a client below v0x04, the only case where the reader
+// cannot tell from the version whether a flags byte follows (see
+// readHandshakeFlags). An answer that ends at 9 bytes is followed by nothing
+// until the first tunnel frame, so the reader must never wait on it for long.
+const handshakeFlagsGrace = 300 * time.Millisecond
+
+// readHandshakeResponse reads the server's TUN handshake response and returns
+// it together with the conn the caller must keep reading tunnel frames from.
+//
+// Nothing past the response is ever consumed: the response is read with exact
+// reads (the 9-byte prefix [status:1][serverIP:4][clientIP:4], the flags byte
+// when there is one, then the layout the flags announce), never with a
+// buffer-sized Read. An exit or relay may start sending tunnel frames right
+// after the response, and a transport is free to hand them over in the same
+// Read; a byte of a frame taken as part of the response shifts every frame
+// after it and the session dies at the next read timeout (issue #93).
+//
+// Whether a flags byte follows the prefix is decided from what the client
+// knows, never from whether a byte happens to arrive in time:
+//
+//   - status != 0: the TUN core refused, and its refusals are the bare 9-byte
+//     prefix. (Some transports refuse with a single 0x01 byte instead; the
+//     prefix read fails on those, bounded by the response deadline.)
+//   - clientVersion >= 0x04: every exit and relay since dual-stack emits the
+//     flags byte to such a client, even when it is zero (buildTUNHandshakeResponse),
+//     so it is read unconditionally.
+//   - below 0x04 the version alone does not settle it: over one transport a
+//     terminating exit answers with a flags byte and a relay forwarding an
+//     exit's h2 answer does not, and the response carries no version echo.
+//     The byte's value does settle it: those versions only get a flags byte
+//     when it is non-zero, while the first byte of any tunnel frame
+//     [len:4][pkt] is zero (len <= maxFrameLen). See readHandshakeFlags.
+//
+// When the byte after the prefix turns out to belong to the first frame, or
+// has not arrived yet, it is handed over through the returned conn; otherwise
+// the returned conn is conn itself. Callers must use the returned conn from
+// then on.
+//
+// deadline bounds every read of the response (zero means handshakeReadTimeout
+// from now), so a peer that sends a prefix and goes quiet fails the handshake
+// instead of hanging it. The reader clears the read deadline before it
+// returns, on every path: the conn goes on to consumers that read without
+// deadlines of their own (the relay's bridge and pump), and a deadline left
+// behind would cut them off once it passed, however busy the tunnel was.
+func readHandshakeResponse(conn net.Conn, clientVersion byte, deadline time.Time) ([]byte, int, net.Conn, error) {
+	if deadline.IsZero() {
+		deadline = time.Now().Add(handshakeReadTimeout)
+	}
+	_ = conn.SetReadDeadline(deadline)
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+
+	resp := make([]byte, handshakeRespBufSize)
+	if _, err := io.ReadFull(conn, resp[:9]); err != nil {
+		return nil, 0, conn, err
+	}
+	if resp[0] != 0x00 {
+		// Refusals built by the TUN core are the bare 9-byte prefix and
+		// nothing follows them. (Transports that refuse with a single byte
+		// never get here: the 9-byte read above fails on them.)
+		return resp, 9, conn, nil
+	}
+	n, next, err := readHandshakeFlags(conn, resp, clientVersion)
+	if err != nil {
+		return nil, 0, conn, err
+	}
+	n, err = readResponseTail(next, resp, n, clientVersion)
+	if err != nil {
+		return nil, 0, conn, err
+	}
+	return resp, n, next, nil
+}
+
+// readHandshakeFlags reads the flags byte resp[9] of a success response whose
+// 9-byte prefix is already in resp, and returns the number of valid bytes in
+// resp (9 or 10) and the conn to continue on.
+//
+// A v0x04 client always gets the byte, so it is read unconditionally under the
+// response deadline. Below v0x04 the byte is present only when non-zero, and
+// what follows a bare 9-byte answer is a tunnel frame starting with 0x00, so
+// the byte is looked at rather than assumed: non-zero is the flags byte, zero
+// is the first byte of a frame and is handed back through a replayConn. When
+// nothing has arrived within handshakeFlagsGrace the answer is taken to have
+// no flags (the only answer that can end at 9 bytes with nothing behind it),
+// and the read still in flight is handed over too.
+func readHandshakeFlags(conn net.Conn, resp []byte, clientVersion byte) (int, net.Conn, error) {
+	if clientVersion >= tunHandshakeVersionDualStack {
+		if _, err := io.ReadFull(conn, resp[9:10]); err != nil {
+			return 9, conn, fmt.Errorf("handshake flags read failed: %w", err)
+		}
+		return 10, conn, nil
+	}
+	peek := peekHandshakeByte(conn)
+	select {
+	case r := <-peek:
+		switch {
+		case r.err != nil:
+			// Nothing followed: the response deadline ran out first, or the
+			// peer closed. Either way there is no flags byte, and the conn
+			// reports its own state to the next read.
+			return 9, conn, nil
+		case r.b != 0:
+			resp[9] = r.b
+			return 10, conn, nil
+		default:
+			return 9, &replayConn{Conn: conn, pending: []byte{r.b}}, nil
+		}
+	case <-time.After(handshakeFlagsGrace):
+		return 9, &replayConn{Conn: conn, inflight: peek}, nil
+	}
+}
+
+// peekResult is the outcome of the one-byte read peekHandshakeByte starts.
+type peekResult struct {
+	b   byte
+	err error
+}
+
+// peekHandshakeByte reads the byte after the 9-byte prefix on its own
+// goroutine and delivers it on the returned channel.
+//
+// The wait is bounded by a timer in readHandshakeFlags, not by a read
+// deadline on the transport. A deadline that fires inside a transport's
+// record read is not harmless: a record layer that has consumed a header and
+// then times out on the body loses its framing (confusion, for one), and some
+// transports do not honour read deadlines at all (the ICMP tunnel), so the
+// peek would hang until the first packet. A read left running past the grace
+// is not lost either: the replayConn that carries it delivers its byte first.
+func peekHandshakeByte(conn net.Conn) <-chan peekResult {
+	ch := make(chan peekResult, 1) // buffered: the goroutine never blocks on a reader that went away
+	go func() {
+		var one [1]byte
+		_, err := io.ReadFull(conn, one[:])
+		ch <- peekResult{b: one[0], err: err}
+	}()
+	return ch
+}
+
+// replayConn returns bytes the handshake reader had to look at before the
+// packet loop reads from the underlying conn, and finishes a peek read the
+// reader stopped waiting for. It deliberately exposes no Unwrap/NetConn
+// accessor: anything reading the inner conn directly would skip the pending
+// bytes or race the read in flight.
+type replayConn struct {
+	net.Conn
+	pending  []byte
+	inflight <-chan peekResult // a peek read still running, nil once collected
+}
+
+func (c *replayConn) Read(p []byte) (int, error) {
+	if c.inflight != nil {
+		r := <-c.inflight
+		c.inflight = nil
+		if r.err != nil {
+			// The read ended without a byte; whatever ended it (a deadline
+			// the caller set since, a close) is this read's answer.
+			return 0, r.err
+		}
+		c.pending = append(c.pending, r.b)
+	}
+	if len(c.pending) > 0 {
+		n := copy(p, c.pending)
+		c.pending = c.pending[n:]
+		return n, nil
+	}
+	return c.Conn.Read(p)
+}
+
+// readResponseTail completes the handshake response beyond the mandatory
+// 9-byte prefix: the version-dependent extended layout and, when the flags
+// byte advertises it, the trailing 32-byte dual-stack block. n is the number
+// of valid bytes already in resp.
+//
+// This runs for every client version, not just the dual-stack one. A v0x03
+// client can be sent the 20+seed port-hop layout, and reading only what the
+// first Read happened to return left the rest of it in the stream for the
+// packet loop to parse as [len:4][pkt:N] - the same silent desync the
+// dual-stack path was fixed for.
+//
+// clientVersion disambiguates the two port-hop layouts, which are otherwise
+// indistinguishable by content: a v0x01 client gets the 14-byte v1 form, and
+// anything above it gets the 20+seed v2 form. Version 0 (a client that sent
+// no version byte) is never offered port hopping, so its branch is moot.
+func readResponseTail(conn net.Conn, resp []byte, n int, clientVersion byte) (int, error) {
+	if n < 10 {
+		return n, nil // legacy 9-byte form, nothing follows
+	}
+	flags := resp[9]
+
+	base := 10
+	switch {
+	case flags&tunFlagPortHopping == 0:
+		// flags-only form
+	case clientVersion == 0x01:
+		base = 14 // v1: port range only
+	default:
+		// v2: the seed length lives at resp[19], so the base has to be
+		// completed that far before its own length is knowable.
+		if n < 20 {
+			m, err := io.ReadFull(conn, resp[n:20])
+			if err != nil {
+				return n, fmt.Errorf("handshake base read failed: %w", err)
+			}
+			n += m
+		}
+		seedLen := int(resp[19])
+		if seedLen > 32 {
+			return n, fmt.Errorf("handshake response declares a %d-byte hop seed, max 32", seedLen)
+		}
+		base = 20 + seedLen
+	}
+
+	need := base
+	if flags&tunFlagDualStack != 0 {
+		need += 32
+	}
+	if need > len(resp) {
+		return n, fmt.Errorf("handshake response too large: need %d bytes", need)
+	}
+	if n < need {
+		m, err := io.ReadFull(conn, resp[n:need])
+		if err != nil {
+			return n, fmt.Errorf("handshake tail read failed: %w", err)
+		}
+		n += m
+	}
+	return n, nil
+}
+
+// handshakeResponseBaseLen returns the length of the version-dependent base
+// layout of a handshake response, excluding the optional 32-byte dual-stack
+// block. A dual-capable client (version 0x04) only ever receives the v2
+// (20+seed) or 10-byte flags-only extended forms — never the 14-byte v1
+// form — so for responses carrying the dual-stack flag the base length is
+// unambiguous.
+func handshakeResponseBaseLen(resp []byte, n int) int {
+	if n < 10 {
+		return n // legacy 9-byte form (or an error response)
+	}
+	if resp[9]&tunFlagPortHopping == 0 {
+		return 10 // flags-only form (v3 probe / v4 dual-stack)
+	}
+	if n >= 20 {
+		if seedLen := int(resp[19]); seedLen <= 32 {
+			return 20 + seedLen // v2 form
+		}
+	}
+	if n >= 14 {
+		return 14 // v1 form
+	}
+	return n
+}
+
+// parseServerCapabilities decodes the optional port-hopping capabilities from a
+// handshake response. The second return value reports whether any capabilities
+// were present.
+func parseServerCapabilities(resp []byte, n int) (ServerCapabilities, bool) {
+	// The flags byte at resp[9] is present in any extended response (>=10 bytes).
+	// A v3 exit may emit a 10-byte response carrying only the MTU-probe flag (no
+	// port hopping), so we no longer require the full 14-byte port-hop response.
+	if n < 10 {
+		return ServerCapabilities{}, false
+	}
+
+	flags := resp[9]
+	caps := ServerCapabilities{
+		MTUProbeSupported: flags&tunFlagMTUProbe != 0,
+	}
+
+	// Dual-stack: the v6 address block trails the version-dependent layout.
+	caps.DualStackEnabled = flags&tunFlagDualStack != 0
+	if caps.DualStackEnabled {
+		base := handshakeResponseBaseLen(resp, n)
+		if n >= base+32 {
+			caps.ServerIP6 = append(net.IP(nil), resp[base:base+16]...)
+			caps.ClientIP6 = append(net.IP(nil), resp[base+16:base+32]...)
+		} else {
+			// Flag set but block missing/truncated: treat as v4-only.
+			caps.DualStackEnabled = false
+		}
+	}
+
+	// Port-hopping fields need the full 14-byte form.
+	if n < 14 || flags&tunFlagPortHopping == 0 {
+		return caps, caps.MTUProbeSupported || caps.DualStackEnabled
+	}
+
+	portStart := int(binary.BigEndian.Uint16(resp[10:12]))
+	portEnd := int(binary.BigEndian.Uint16(resp[12:14]))
+	if portStart <= 0 || portEnd <= portStart {
+		return caps, caps.MTUProbeSupported || caps.DualStackEnabled
+	}
+
+	caps.PortHoppingEnabled = true
+	caps.PortRangeStart = portStart
+	caps.PortRangeEnd = portEnd
+	caps.HopIntervalSec = 60    // Default
+	caps.HopStrategy = "random" // Default
+
+	// Parse extended v2 fields if available (20+ bytes).
+	if n < 20 {
+		log.Info("Server advertises port hopping: range %d-%d (v1 response)", portStart, portEnd)
+		return caps, true
+	}
+
+	hopInterval := int(binary.BigEndian.Uint32(resp[14:18]))
+	strategyByte := resp[18]
+	seedLen := int(resp[19])
+
+	if hopInterval > 0 {
+		caps.HopIntervalSec = hopInterval
+	}
+
+	switch strategyByte {
+	case 0x00:
+		caps.HopStrategy = "random"
+	case 0x01:
+		caps.HopStrategy = "sequential"
+	case 0x02:
+		caps.HopStrategy = "fibonacci"
+	}
+
+	if seedLen > 0 && n >= 20+seedLen && seedLen <= 32 {
+		caps.HopSeed = make([]byte, seedLen)
+		copy(caps.HopSeed, resp[20:20+seedLen])
+		log.Info("Server advertises port hopping: range %d-%d, interval %ds, strategy %s, seed_len %d",
+			portStart, portEnd, caps.HopIntervalSec, caps.HopStrategy, seedLen)
+	} else {
+		log.Info("Server advertises port hopping: range %d-%d, interval %ds, strategy %s",
+			portStart, portEnd, caps.HopIntervalSec, caps.HopStrategy)
+	}
+
+	return caps, true
+}
+
+// GetServerCapabilities returns capabilities received from server during handshake
+func (v *VPNClient) GetServerCapabilities() ServerCapabilities {
+	return v.serverCaps
+}
+
+// LocalIP returns the tunnel address the interface actually carries: the one
+// the exit assigned during the handshake, or the requested one when the exit
+// echoed it back unchanged. Callers that log the address must use this rather
+// than the configured VPNConfig.LocalIP — after Start returns, connect has
+// already replaced the requested address with the assigned one and updated the
+// TUN device, so the configured value is stale.
+//
+// Taken under v.mu, the same lock connect holds while it mutates localIP.
+// The result is a copy: net.IP is a slice, and handing out the live one would
+// let a caller mutate the client's own state.
+func (v *VPNClient) LocalIP() net.IP {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.localIP == nil {
+		return nil
+	}
+	out := make(net.IP, len(v.localIP))
+	copy(out, v.localIP)
+	return out
+}
+
+// sendKeepalive periodically sends keepalive packets to prevent timeout
+func (v *VPNClient) sendKeepalive() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("sendKeepalive panic: %v", r)
+			v.handleDisconnect()
+		}
+	}()
+
+	ticker := time.NewTicker(keepaliveInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if atomic.LoadInt32(&v.running) == 0 {
+				return
+			}
+
+			v.mu.Lock()
+			conn := v.conn
+			lastActive := v.lastActive
+			v.mu.Unlock()
+
+			if conn == nil {
+				continue
+			}
+
+			// Only send keepalive if no recent activity
+			if time.Since(lastActive) >= keepaliveInterval-time.Second {
+				// Send zero-length packet as keepalive: [length:4=0]
+				keepalivePkt := make([]byte, 4)
+				binary.BigEndian.PutUint32(keepalivePkt, 0)
+
+				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				if _, err := conn.Write(keepalivePkt); err != nil {
+					log.Debug("Keepalive write error: %v", err)
+					v.handleDisconnect()
+				} else {
+					log.Debug("Sent keepalive packet")
+				}
+			}
+
+		case <-v.stopCh:
+			return
+		}
+	}
+}
+
+// readFromTun reads packets from TUN and sends to server
+func (v *VPNClient) readFromTun() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("readFromTun panic: %v", r)
+			v.handleDisconnect()
+		}
+	}()
+
+	buf := make([]byte, v.tun.mtu+4)
+	log.Debug("readFromTun goroutine started, waiting for packets from TUN device")
+	// buf is sized at the construction-time cap; auto-MTU only lowers (or raises
+	// back up to the cap) the live MTU, so this buffer always fits a read.
+
+	for atomic.LoadInt32(&v.running) == 1 {
+		n, err := v.tun.Read(buf[4:])
+		if err != nil {
+			if atomic.LoadInt32(&v.running) == 0 {
+				return
+			}
+			log.Debug("TUN read error: %v", err)
+			continue
+		}
+		if log.DebugEnabled() {
+			dumpEnd := n + 4
+			if dumpEnd > 24 {
+				dumpEnd = 24
+			}
+			log.Debug("Read %d bytes from TUN, first 20 bytes: % x", n, buf[4:dumpEnd])
+		}
+
+		// Clamp TCP MSS on SYN/SYN-ACK packets to prevent oversized segments
+		ClampTCPMSS(buf[4:4+n], v.tun.MTU())
+
+		// Frame packet: [length:4][data:n]
+		binary.BigEndian.PutUint32(buf[:4], uint32(n))
+
+		v.mu.Lock()
+		conn := v.conn
+		v.lastActive = time.Now() // Update activity timestamp
+		v.mu.Unlock()
+
+		if conn == nil {
+			log.Debug("TUN->Server: conn is nil, dropping %d bytes", n)
+			continue
+		}
+
+		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		written, err := conn.Write(buf[:n+4])
+		if err != nil {
+			log.Debug("Server write error: %v", err)
+			v.handleDisconnect()
+			continue
+		}
+
+		if log.DebugEnabled() {
+			log.Debug("TUN->Server: sent %d bytes (payload=%d) to server", written, n)
+		}
+		atomic.AddInt64(&v.packetsUp, 1)
+		atomic.AddInt64(&v.bytesUp, int64(n))
+	}
+}
+
+// readFromServer reads packets from server and writes to TUN
+func (v *VPNClient) readFromServer() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("readFromServer panic: %v", r)
+			v.handleDisconnect()
+		}
+	}()
+
+	lenBuf := make([]byte, 4)
+
+	// One rx buffer for the whole goroutine instead of a per-packet make(): this
+	// is the single reader of the connection and nothing downstream retains the
+	// slice past the loop iteration (the probe decoder copies out its nonce,
+	// BuildICMPFragNeeded builds a fresh packet, tun.Write is synchronous).
+	// Sized at the protocol frame ceiling because an oversized frame still has to
+	// be read off the wire before it can be dropped.
+	rxBuf := make([]byte, maxFrameLen)
+
+	for atomic.LoadInt32(&v.running) == 1 {
+		v.mu.Lock()
+		conn := v.conn
+		v.mu.Unlock()
+
+		if conn == nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		// Read packet length with extended timeout (keepalive keeps connection alive)
+		conn.SetReadDeadline(time.Now().Add(readTimeout))
+		nLen, err := io.ReadFull(conn, lenBuf)
+		if err != nil {
+			if atomic.LoadInt32(&v.running) == 0 {
+				return
+			}
+			log.Debug("Server read error: %v", err)
+			v.handleDisconnect()
+			continue
+		}
+
+		pktLen := binary.BigEndian.Uint32(lenBuf)
+
+		// Handle keepalive packet (zero length)
+		if pktLen == 0 {
+			log.Debug("Received keepalive from server")
+			v.mu.Lock()
+			v.lastActive = time.Now()
+			v.mu.Unlock()
+			continue
+		}
+
+		if log.DebugEnabled() {
+			log.Debug("Read length header: %d bytes, value=%d (0x%02x %02x %02x %02x)",
+				nLen, pktLen, lenBuf[0], lenBuf[1], lenBuf[2], lenBuf[3])
+		}
+
+		if pktLen > maxFrameLen {
+			log.Debug("Frame length %d exceeds protocol max, disconnecting", pktLen)
+			v.handleDisconnect()
+			continue
+		}
+
+		// Read packet data
+		buf := rxBuf[:pktLen]
+		nRead, err := io.ReadFull(conn, buf)
+		if err != nil {
+			log.Debug("Server read data error: %v", err)
+			v.handleDisconnect()
+			continue
+		}
+
+		// Auto-MTU: intercept PROBE_REPLY control frames before any IP handling.
+		// They must never be written to the TUN device, and a reply may be larger
+		// than the current (lowered) interface MTU, so this check precedes the
+		// oversized-packet guard below.
+		if isProbeFramePayload(buf) {
+			if pr := v.prober.Load(); pr != nil {
+				pr.HandleReply(buf)
+			}
+			continue
+		}
+
+		// Oversized real packet: drop and inject ICMP Fragmentation Needed so the
+		// inner peer shrinks instead of black-holing.
+		if pktLen > uint32(v.tun.MTU()) {
+			log.Debug("Packet too large (%d > MTU %d), dropping and sending ICMP", pktLen, v.tun.MTU())
+			icmpPkt := BuildICMPFragNeeded(v.tun.remoteIP, buf, uint16(v.tun.MTU()))
+			if icmpPkt != nil {
+				if _, err := v.tun.Write(icmpPkt); err != nil {
+					log.Debug("Failed to inject ICMP frag needed: %v", err)
+				}
+			}
+			continue
+		}
+		if log.DebugEnabled() {
+			if len(buf) >= 8 {
+				log.Debug("Read packet data: %d bytes, first 8 bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
+					nRead, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7])
+			} else if len(buf) > 0 {
+				log.Debug("Read packet data: %d bytes: % x", nRead, buf)
+			}
+		}
+
+		// Check if packet data starts with another length prefix (HTTP/2 framing artifact)
+		// Server sends: [outer_len=88][inner_len=84][IP_packet=84 bytes]
+		// We read outer_len (88), then 88 bytes containing both inner_len and IP packet
+		actualBuf := buf
+		if len(buf) >= 4 {
+			innerLen := binary.BigEndian.Uint32(buf[:4])
+			if innerLen+4 == uint32(len(buf)) {
+				log.Debug("DETECTED: Packet has inner length prefix (%d+4=%d), skipping 4 bytes", innerLen, len(buf))
+				actualBuf = buf[4:]
+			}
+		}
+
+		// Clamp TCP MSS on incoming SYN/SYN-ACK before writing to TUN
+		ClampTCPMSS(actualBuf, v.tun.MTU())
+
+		// Write to TUN
+		if log.DebugEnabled() && len(actualBuf) > 0 {
+			// Log first 20 bytes to verify IP packet format
+			dumpLen := 20
+			if len(actualBuf) < dumpLen {
+				dumpLen = len(actualBuf)
+			}
+			log.Debug("About to write %d bytes to TUN, first %d bytes: % x", len(actualBuf), dumpLen, actualBuf[:dumpLen])
+		}
+
+		n, err := v.tun.Write(actualBuf)
+		if err != nil {
+			log.Debug("TUN write error: %v | len=%d | wrote=%d", err, len(actualBuf), n)
+			continue
+		}
+		if log.DebugEnabled() {
+			log.Debug("Successfully wrote %d bytes to TUN", n)
+		}
+
+		// Update activity timestamp
+		v.mu.Lock()
+		v.lastActive = time.Now()
+		v.mu.Unlock()
+
+		atomic.AddInt64(&v.packetsDown, 1)
+		atomic.AddInt64(&v.bytesDown, int64(pktLen))
+	}
+}
+
+// handleDisconnect handles connection loss and reconnects with exponential backoff
+// and network connectivity detection
+func (v *VPNClient) handleDisconnect() {
+	// Skip if seamless port hop is in progress (it handles its own reconnect)
+	if atomic.LoadInt32(&v.portHopInProgress) == 1 {
+		log.Debug("Port hop in progress, skipping handleDisconnect")
+		return
+	}
+
+	// Prevent concurrent reconnect attempts from multiple goroutines
+	// (readFromTun, readFromServer, sendKeepalive can all call this)
+	if !atomic.CompareAndSwapInt32(&v.reconnecting, 0, 1) {
+		log.Debug("Reconnect already in progress, skipping")
+		return
+	}
+	defer atomic.StoreInt32(&v.reconnecting, 0)
+
+	v.mu.Lock()
+	if v.conn != nil {
+		v.conn.Close()
+		v.conn = nil
+	}
+	endedStrategy := v.strategy
+	v.mu.Unlock()
+
+	// Update strategy confidence and feed the storm detector. A session that
+	// connected fine but died within seconds is the signature of DPI tearing
+	// down a strategy's pattern: connect() keeps succeeding so the circuit
+	// breaker never trips, but the tunnel carries no traffic. The detector
+	// catches this by session lifetime and (in auto mode) parks the strategy so
+	// the next reconnect picks a different one.
+	if endedStrategy != nil && v.manager != nil {
+		v.manager.UpdateStrategyConfidence(endedStrategy.ID(), false)
+		v.manager.RecordSessionEnd(endedStrategy.ID())
+	}
+
+	// Initialize exponential backoff
+	currentDelay := reconnectInitialDelay
+	consecutiveFailures := 0
+	lastNetworkCheck := time.Time{}
+	networkAvailable := true
+
+	log.Info("VPN disconnected, starting reconnect with exponential backoff")
+
+	// Try to reconnect with exponential backoff
+	for atomic.LoadInt32(&v.running) == 1 {
+		consecutiveFailures++
+
+		// Check network connectivity periodically (every 10 failures or 30 seconds)
+		// This prevents wasting resources when network is down
+		if consecutiveFailures%10 == 0 || time.Since(lastNetworkCheck) > 30*time.Second {
+			networkAvailable = v.checkNetworkConnectivity()
+			lastNetworkCheck = time.Now()
+
+			if !networkAvailable {
+				// Reset circuit breakers since failures are due to no network
+				if v.manager != nil {
+					v.manager.ResetForNetworkChange()
+				}
+				log.Warn("No network connectivity, waiting for network to restore...")
+				if !v.waitForNetworkRestore() {
+					return
+				}
+				// After the wait, reset backoff and fall through to a real
+				// connect attempt. Falling through instead of continue is the
+				// point: the probe that said "no network" can itself be wrong,
+				// so every wait must end in an actual dial rather than in
+				// another probe round that parks again.
+				currentDelay = reconnectInitialDelay
+				consecutiveFailures = 1
+			}
+		}
+
+		log.Info("Reconnecting VPN (attempt %d, backoff %v)...", consecutiveFailures, currentDelay)
+
+		// Use shorter timeout for reconnect attempts
+		connectTimeout := 15 * time.Second
+		if currentDelay > 30*time.Second {
+			connectTimeout = 30 * time.Second // Longer timeout for longer backoffs
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+		err := v.connect(ctx)
+		cancel()
+
+		if err == nil {
+			atomic.AddInt64(&v.reconnectsOK, 1)
+			log.Info("VPN reconnected successfully after %d attempts", consecutiveFailures)
+			// Re-probe MTU on reconnect (network change may shift path-MTU). Uses a
+			// background context, not the short-lived connect ctx; the probe is
+			// self-bounded by its own deadlines.
+			v.maybeStartMTUProbe(context.Background(), "reconnect")
+			return
+		}
+
+		atomic.AddInt64(&v.reconnectsFail, 1)
+
+		// Classify error type for better logging
+		errType := classifyError(err)
+		log.Warn("Reconnect failed (%s): %v, next attempt in %v", errType, err, currentDelay)
+
+		// If all strategies are blocked (circuit breakers open), reset them
+		if v.manager != nil && !v.manager.HasAvailableStrategies() {
+			log.Warn("All strategies blocked by circuit breakers, resetting...")
+			v.manager.ResetForNetworkChange()
+		}
+
+		// Wait with jitter before next attempt
+		select {
+		case <-v.stopCh:
+			log.Info("Reconnect cancelled (VPN stopped)")
+			return
+		case <-time.After(addJitter(currentDelay)):
+		}
+
+		// Exponential backoff with cap
+		currentDelay = time.Duration(float64(currentDelay) * reconnectMultiplier)
+		if currentDelay > reconnectMaxDelay {
+			currentDelay = reconnectMaxDelay
+		}
+	}
+}
+
+// networkCheckTimeout bounds one connectivity probe from the reconnect loop.
+const networkCheckTimeout = 3 * time.Second
+
+// checkNetworkConnectivity answers "is there a network at all", in two steps:
+// the server first, then a well-known public host.
+//
+// The server step goes through the manager's own connectivity gate, which dials
+// the pinned endpoint (and its sibling address) on the real transport port.
+// This used to be hand-rolled here and additionally dialled :443 and :80 on the
+// server's own host - a three-port scan of our own machine, run on a timer, and
+// a signature in its own right. It also only ever spoke IPv4, so a v6-only
+// endpoint reported "no network" forever.
+//
+// The second step is unchanged and is what distinguishes "the network is down"
+// from "the network is up and the server is not": the caller parks in
+// waitForNetworkRestore only for the former.
+func (v *VPNClient) checkNetworkConnectivity() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), networkCheckTimeout)
+	defer cancel()
+
+	if v.manager != nil {
+		if checker := v.manager.ConnectivityChecker(); checker != nil {
+			if checker.Check(ctx).HasBasicConnectivity() {
+				return true
+			}
+		} else if v.serverAddr != "" {
+			// No gate configured (macOS, benchmarks): one dial of the real
+			// address, and nothing else.
+			conn, err := net.DialTimeout("tcp", v.serverAddr, networkCheckTimeout)
+			if err == nil {
+				conn.Close()
+				return true
+			}
+		}
+	}
+
+	return internetReachable()
+}
+
+// errMeansPathAlive reports whether a dial error still suggests the path is
+// up rather than silently dead. An immediate refusal usually means an RST
+// came back - packets flowed both ways. A local firewall can fake that with a
+// REJECT rule, but the caller only uses "alive" to keep retrying the
+// connection instead of parking, which is the safe direction to err in.
+// Refusals matter because the gate dials the default-route gateway, and
+// consumer routers routinely have port 53 closed.
+func errMeansPathAlive(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED)
+}
+
+// dialMeansAlive dials addr and treats both a completed connect and an
+// immediate refusal as "the path answers".
+func dialMeansAlive(addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, networkCheckTimeout)
+	if err == nil {
+		conn.Close()
+		return true
+	}
+	return errMeansPathAlive(err)
+}
+
+// publicFallbackProbes are the last-resort dial targets when no physical
+// gateway was resolved (non-Linux platforms, exotic setups). These addresses
+// are routinely part of the installed TUN routes, so while the tunnel is down
+// they black-hole - which is why they are probes of last resort, not first.
+var publicFallbackProbes = []string{"8.8.8.8:53", "1.1.1.1:53"}
+
+// internetReachable reports whether anything outside answers. It must never
+// probe through the VPN tunnel itself: while the tunnel is down its routes
+// stay installed, and a probe routed into a dead TUN device reads as "no
+// network" - the exact false negative that used to park the reconnect loop
+// forever while the physical link was fine (8.8.8.8, 8.8.4.8, 9.9.9.9 and
+// 1.1.1.1 are all part of the installed tunnel routes). The default-route
+// gateway is probed first precisely because it cannot take the tunnel; public
+// resolvers remain the fallback for setups where no gateway was resolved.
+// It is deliberately NOT a check of our own server: the caller needs to tell
+// a dead link apart from a blocked endpoint, and only a third party can do
+// that.
+func internetReachable() bool {
+	for _, addr := range physicalGateAddrs() {
+		if dialMeansAlive(addr) {
+			return true
+		}
+	}
+	for _, addr := range publicFallbackProbes {
+		conn, err := net.DialTimeout("tcp", addr, networkCheckTimeout)
+		if err == nil {
+			conn.Close()
+			return true
+		}
+	}
+	return false
+}
+
+// networkParkTimeout caps one wait for "network restore". The wait's own probe
+// can be wrong about the network being down, so parking must stay bounded:
+// past the cap the caller retries the real connection instead of trusting the
+// probe indefinitely.
+const networkParkTimeout = 2 * time.Minute
+
+// waitForNetworkRestore waits until network connectivity is restored, at most
+// networkParkTimeout. Returns false only when the client was stopped; a
+// timeout returns true so the caller goes straight to a real connect attempt -
+// the negative verdict that caused the wait can itself be wrong.
+func (v *VPNClient) waitForNetworkRestore() bool {
+	checkInterval := 5 * time.Second
+	deadline := time.Now().Add(networkParkTimeout)
+	attempt := 0
+
+	for atomic.LoadInt32(&v.running) == 1 {
+		attempt++
+		if attempt%12 == 0 { // Every minute
+			log.Info("Still waiting for network connectivity (attempt %d)...", attempt)
+		}
+
+		select {
+		case <-v.stopCh:
+			return false
+		case <-time.After(checkInterval):
+		}
+
+		if v.checkNetworkConnectivity() {
+			log.Info("Network connectivity restored after %d checks", attempt)
+			return true
+		}
+
+		if time.Now().After(deadline) {
+			log.Warn("Network still considered down after %v - retrying connection anyway", networkParkTimeout)
+			return true
+		}
+	}
+	return false
+}
+
+// addJitter adds random jitter to a duration (+/- jitterFactor)
+func addJitter(d time.Duration) time.Duration {
+	jitter := float64(d) * reconnectJitterFactor * (2*rand.Float64() - 1)
+	return d + time.Duration(jitter)
+}
+
+// classifyError returns a short description of the error type
+func classifyError(err error) string {
+	if err == nil {
+		return "none"
+	}
+
+	errStr := err.Error()
+
+	if strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline") {
+		return "timeout"
+	}
+	if strings.Contains(errStr, "connection refused") {
+		return "refused"
+	}
+	if strings.Contains(errStr, "no route") || strings.Contains(errStr, "unreachable") {
+		return "no_route"
+	}
+	if strings.Contains(errStr, "network is down") || strings.Contains(errStr, "no network") {
+		return "network_down"
+	}
+	if strings.Contains(errStr, "all strategies failed") {
+		return "strategies_exhausted"
+	}
+	if strings.Contains(errStr, "circuit") {
+		return "circuit_breaker"
+	}
+	if strings.Contains(errStr, "EOF") || strings.Contains(errStr, "reset") {
+		return "connection_reset"
+	}
+
+	return "unknown"
+}
+
+// Stop stops the VPN tunnel
+func (v *VPNClient) Stop() {
+	if !atomic.CompareAndSwapInt32(&v.running, 1, 0) {
+		return
+	}
+
+	close(v.stopCh)
+
+	// Abort any in-flight connect() dial/handshake. connect() does NOT hold
+	// v.mu while dialing, so cancelling its context (and, below, closing the
+	// conn) lets Stop() proceed without waiting on a 10-30s network timeout.
+	if cancel := v.connCancel.Swap(nil); cancel != nil {
+		(*cancel)()
+	}
+
+	// Set immediate deadline to unblock any blocking reads before closing.
+	v.mu.Lock()
+	if v.conn != nil {
+		v.conn.SetDeadline(time.Now()) // Force immediate timeout
+		v.conn.Close()
+	}
+	v.mu.Unlock()
+
+	// Unblock TUN read goroutine and close
+	v.tun.SetReadDeadline(time.Now())
+	v.tun.Close()
+
+	log.Info("VPN tunnel stopped (packets: up=%d down=%d, bytes: up=%d down=%d)",
+		v.packetsUp, v.packetsDown, v.bytesUp, v.bytesDown)
+}
+
+// Stats returns current VPN statistics
+func (v *VPNClient) Stats() (packetsUp, packetsDown, bytesUp, bytesDown int64) {
+	return atomic.LoadInt64(&v.packetsUp),
+		atomic.LoadInt64(&v.packetsDown),
+		atomic.LoadInt64(&v.bytesUp),
+		atomic.LoadInt64(&v.bytesDown)
+}
+
+// LifecycleStats returns cumulative tunnel lifecycle counters: total successful
+// tunnel establishments, successful reconnects and failed reconnect attempts.
+// The client's metrics syncer polls these to feed connections_total and
+// reconnects_total.
+func (v *VPNClient) LifecycleStats() (connects, reconnectsOK, reconnectsFail int64) {
+	return atomic.LoadInt64(&v.tunnelConnects),
+		atomic.LoadInt64(&v.reconnectsOK),
+		atomic.LoadInt64(&v.reconnectsFail)
+}
+
+// CurrentStrategy returns the current strategy being used
+func (v *VPNClient) CurrentStrategy() strategy.Strategy {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.strategy
+}
+
+// RunTUNRelay runs packet relay between TUN device and server connection
+// This is used by control socket mode where connection is already established
+// If stopCh is nil, creates internal one; if provided, uses external control
+func RunTUNRelay(tunDev *TUNDevice, serverConn net.Conn, localIP, remoteIP net.IP) {
+	RunTUNRelayWithStop(tunDev, serverConn, localIP, remoteIP, nil)
+}
+
+// RelayErrorCallback is called when relay dies due to network error
+// Deprecated: use RelayCallbacks instead
+type RelayErrorCallback func(reason string)
+
+// RelayCallbacks contains all callbacks for TUN relay events
+type RelayCallbacks struct {
+	OnError     func(reason string) // Called when relay dies (timeout, read error, etc.)
+	OnKeepalive func()              // Called when keepalive received from server
+}
+
+// RunTUNRelayWithStop runs packet relay with external stop control
+func RunTUNRelayWithStop(tunDev *TUNDevice, serverConn net.Conn, localIP, remoteIP net.IP, externalStopCh chan struct{}) {
+	RunTUNRelayWithCallbacks(tunDev, serverConn, localIP, remoteIP, externalStopCh, nil)
+}
+
+// RunTUNRelayWithCallback runs packet relay with external stop control and error callback
+// Deprecated: use RunTUNRelayWithCallbacks for full event support
+func RunTUNRelayWithCallback(tunDev *TUNDevice, serverConn net.Conn, localIP, remoteIP net.IP, externalStopCh chan struct{}, onError RelayErrorCallback) {
+	var callbacks *RelayCallbacks
+	if onError != nil {
+		callbacks = &RelayCallbacks{OnError: onError}
+	}
+	RunTUNRelayWithCallbacks(tunDev, serverConn, localIP, remoteIP, externalStopCh, callbacks)
+}
+
+// RunTUNRelayWithCallbacks runs packet relay with external stop control and full callback support
+// Includes proactive dead connection detection (45s timeout) and keepalive event notifications
+func RunTUNRelayWithCallbacks(tunDev *TUNDevice, serverConn net.Conn, localIP, remoteIP net.IP, externalStopCh chan struct{}, callbacks *RelayCallbacks) {
+	newTUNRelay(tunDev, serverConn, localIP, remoteIP, externalStopCh, callbacks).run()
+}
+
+// tunRelay is one relay over a server connection, with a handle that lets
+// the TUN side be replaced while it runs.
+//
+// With an external stop channel the server connection belongs to whoever
+// started the relay (the control server's session), not to the relay: a
+// relay its owner stopped leaves the connection alone and reports nothing,
+// because the owner is either closing the connection itself or handing it
+// on. Only a relay that dies on its own - a read or write on the connection
+// failing while nobody asked it to stop - closes the connection and reports
+// OnError. Without an external stop channel the relay owns the connection
+// and always closes it, as before.
+type tunRelay struct {
+	serverConn net.Conn
+	remoteIP   net.IP
+	localIP    net.IP
+	callbacks  *RelayCallbacks
+
+	stopCh       chan struct{}
+	ownerStopped func() bool // the external stop channel was closed
+	safeClose    func()
+
+	tun          atomic.Pointer[TUNDevice] // where server->TUN writes go
+	lastActivity atomic.Int64
+
+	// firstDev/firstStop are the reader run starts with, fixed at
+	// construction: a SwapTUN that lands before run gets going must still
+	// find - and stop - the reader of the device it replaces.
+	firstDev  *TUNDevice
+	firstStop chan struct{}
+
+	mu         sync.Mutex
+	readerStop chan struct{} // stops the reader of the current TUN only
+	done       chan struct{} // closed when run returns
+}
+
+func newTUNRelay(tunDev *TUNDevice, serverConn net.Conn, localIP, remoteIP net.IP, externalStopCh chan struct{}, callbacks *RelayCallbacks) *tunRelay {
+	stopCh, safeClose := makeStopChannel(externalStopCh)
+	r := &tunRelay{
+		serverConn: serverConn,
+		localIP:    localIP,
+		remoteIP:   remoteIP,
+		callbacks:  callbacks,
+		stopCh:     stopCh,
+		safeClose:  safeClose,
+		readerStop: make(chan struct{}),
+		done:       make(chan struct{}),
+	}
+	r.ownerStopped = func() bool {
+		if externalStopCh == nil {
+			return false
+		}
+		select {
+		case <-externalStopCh:
+			return true
+		default:
+			return false
+		}
+	}
+	r.tun.Store(tunDev)
+	r.firstDev, r.firstStop = tunDev, r.readerStop
+	r.updateActivity()
+	return r
+}
+
+// startTUNRelay runs a relay in its own goroutine and returns its handle.
+func startTUNRelay(tunDev *TUNDevice, serverConn net.Conn, localIP, remoteIP net.IP, externalStopCh chan struct{}, callbacks *RelayCallbacks) *tunRelay {
+	r := newTUNRelay(tunDev, serverConn, localIP, remoteIP, externalStopCh, callbacks)
+	go r.run()
+	return r
+}
+
+func (r *tunRelay) updateActivity() { r.lastActivity.Store(time.Now().UnixNano()) }
+
+func (r *tunRelay) idleDuration() time.Duration {
+	return time.Since(time.Unix(0, r.lastActivity.Load()))
+}
+
+// connFailed is called when a write on the server connection fails. A
+// relay its owner did not stop treats that as the connection dying and
+// closes it, so the server reader fails at once and the death is reported
+// now instead of after the read timeout.
+func (r *tunRelay) connFailed() {
+	if !r.ownerStopped() {
+		r.serverConn.Close()
+	}
+}
+
+func (r *tunRelay) run() {
+	defer close(r.done)
+	log.Info("Starting TUN relay (local=%s, remote=%s)", r.localIP, r.remoteIP)
+
+	// Both helpers stop with this relay, not only with its owner: after the
+	// relay died on its own nobody may close stopCh for a long time, and a
+	// monitor left running would report the same death again 45s later -
+	// after a restart, into a control connection that no longer exists.
+	go runDeadConnectionMonitor(r.stopCh, r.done, r.safeClose, r.idleDuration, r.callbacks)
+	go runKeepaliveSender(r.stopCh, r.done, r.serverConn, r.connFailed)
+	go runTUNToServer(r.stopCh, r.firstStop, r.safeClose, r.firstDev, r.serverConn, r.updateActivity, r.connFailed)
+
+	errorReason := runServerToTUN(r.stopCh, r.safeClose, &r.tun, r.serverConn, r.remoteIP, r.updateActivity, r.callbacks)
+
+	r.safeClose()
+	if r.ownerStopped() {
+		// The owner stopped us and keeps the connection; whatever the reader
+		// returned (its read was cut short on purpose) is not a death.
+		log.Info("TUN relay stopped by its owner")
+		return
+	}
+	r.serverConn.Close()
+	log.Info("TUN relay stopped (reason: %s)", errorReason)
+
+	if r.callbacks != nil && r.callbacks.OnError != nil && errorReason != "" {
+		r.callbacks.OnError(errorReason)
+	}
+}
+
+// SwapTUN moves a running relay onto newDev. The server connection, the
+// server reader, the keepalive sender and the dead-connection monitor carry
+// on untouched: from the exit's side nothing happens. Server->TUN writes go
+// to newDev from now on, a reader for newDev starts, and the reader of the
+// previous device is told to stop; the caller closes that device, which
+// wakes the reader if it is blocked. Reports false if the relay is no longer
+// running, in which case nothing changed.
+func (r *tunRelay) SwapTUN(newDev *TUNDevice) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	select {
+	case <-r.done:
+		return false
+	default:
+	}
+	if r.ownerStopped() {
+		return false
+	}
+	close(r.readerStop)
+	r.readerStop = make(chan struct{})
+	r.tun.Store(newDev)
+	go runTUNToServer(r.stopCh, r.readerStop, r.safeClose, newDev, r.serverConn, r.updateActivity, r.connFailed)
+	return true
+}
+
+// makeStopChannel returns the stop channel and a safe-close function.
+// If externalStopCh is provided it is used directly; otherwise a new channel is created.
+func makeStopChannel(externalStopCh chan struct{}) (chan struct{}, func()) {
+	if externalStopCh != nil {
+		return externalStopCh, func() {}
+	}
+	stopCh := make(chan struct{})
+	var once sync.Once
+	return stopCh, func() { once.Do(func() { close(stopCh) }) }
+}
+
+// runDeadConnectionMonitor periodically checks for idle connections and triggers safeClose.
+func runDeadConnectionMonitor(stopCh chan struct{}, relayDone <-chan struct{}, safeClose func(), getIdleDuration func() time.Duration, callbacks *RelayCallbacks) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			idle := getIdleDuration()
+			if idle > deadConnectionTimeout {
+				log.Warn("Connection dead: no activity for %v", idle)
+				if callbacks != nil && callbacks.OnError != nil {
+					callbacks.OnError(fmt.Sprintf("no_activity: %v", idle))
+				}
+				safeClose()
+				return
+			}
+		case <-stopCh:
+			return
+		case <-relayDone:
+			return
+		}
+	}
+}
+
+// runKeepaliveSender periodically writes zero-length keepalive frames to serverConn.
+func runKeepaliveSender(stopCh chan struct{}, relayDone <-chan struct{}, serverConn net.Conn, connFailed func()) {
+	ticker := time.NewTicker(keepaliveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			keepalive := make([]byte, 4)
+			serverConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if _, err := serverConn.Write(keepalive); err != nil {
+				log.Debug("Keepalive write error: %v", err)
+				connFailed()
+				return
+			}
+			log.Debug("Sent keepalive")
+		case <-stopCh:
+			return
+		case <-relayDone:
+			return
+		}
+	}
+}
+
+// runTUNToServer reads IP packets from one TUN device and frames them to
+// serverConn. readerStop ends this reader alone (the relay moved to another
+// device); stopCh ends the whole relay.
+func runTUNToServer(stopCh, readerStop chan struct{}, safeClose func(), tunDev *TUNDevice, serverConn net.Conn, updateActivity func(), connFailed func()) {
+	buf := make([]byte, tunDev.mtu+4)
+	pktCount := 0
+	for {
+		select {
+		case <-stopCh:
+			log.Debug("TUN->Server: stop signal received")
+			return
+		case <-readerStop:
+			log.Debug("TUN->Server: TUN replaced, reader for the old device exits")
+			return
+		default:
+		}
+
+		n, err := tunDev.Read(buf[4:])
+		if err != nil {
+			if isTemporaryError(err) {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			select {
+			case <-readerStop:
+				// The device was closed because the relay moved off it.
+				log.Debug("TUN->Server: old device closed after swap: %v", err)
+				return
+			default:
+			}
+			log.Debug("TUN read error: %v", err)
+			safeClose()
+			return
+		}
+
+		pktCount++
+		if pktCount <= 5 || pktCount%100 == 0 {
+			log.Debug("TUN->Server: read %d bytes from TUN (pkt #%d)", n, pktCount)
+		}
+
+		ClampTCPMSS(buf[4:4+n], tunDev.mtu)
+		binary.BigEndian.PutUint32(buf[:4], uint32(n))
+
+		serverConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if _, err := serverConn.Write(buf[:n+4]); err != nil {
+			log.Debug("Server write error: %v", err)
+			connFailed()
+			safeClose()
+			return
+		}
+		updateActivity()
+	}
+}
+
+// runServerToTUN reads framed packets from serverConn and writes them to the
+// relay's current TUN device, re-read per packet so a swap takes effect on
+// the next one. Returns an error reason string (empty if stopped intentionally).
+func runServerToTUN(stopCh chan struct{}, safeClose func(), tun *atomic.Pointer[TUNDevice], serverConn net.Conn, remoteIP net.IP, updateActivity func(), callbacks *RelayCallbacks) string {
+	lenBuf := make([]byte, 4)
+	pktCount := 0
+	for {
+		select {
+		case <-stopCh:
+			log.Debug("Server->TUN: stop signal received")
+			safeClose()
+			// NOTE: serverConn is NOT closed here — callers manage its lifecycle.
+			log.Info("TUN relay stopped (by stop signal)")
+			return ""
+		default:
+		}
+
+		serverConn.SetReadDeadline(time.Now().Add(readTimeout))
+		if _, err := io.ReadFull(serverConn, lenBuf); err != nil {
+			log.Debug("Server read error: %v", err)
+			return fmt.Sprintf("server_read: %v", err)
+		}
+
+		updateActivity()
+		pktLen := binary.BigEndian.Uint32(lenBuf)
+
+		if pktLen == 0 {
+			log.Debug("Received keepalive from server")
+			if callbacks != nil && callbacks.OnKeepalive != nil {
+				callbacks.OnKeepalive()
+			}
+			continue
+		}
+
+		tunDev := tun.Load()
+		if reason := handleOversizedPacket(tunDev, serverConn, remoteIP, pktLen); reason != "" {
+			if reason == "dropped" {
+				continue
+			}
+			return reason
+		}
+
+		buf := make([]byte, pktLen)
+		if _, err := io.ReadFull(serverConn, buf); err != nil {
+			log.Debug("Server read data error: %v", err)
+			return fmt.Sprintf("server_read_data: %v", err)
+		}
+
+		ClampTCPMSS(buf, tunDev.mtu)
+
+		pktCount++
+		if pktCount <= 5 || pktCount%100 == 0 {
+			log.Debug("Server->TUN: writing %d bytes to TUN (pkt #%d)", pktLen, pktCount)
+		}
+
+		if _, err := tunDev.Write(buf); err != nil {
+			log.Debug("TUN write error: %v", err)
+		}
+	}
+}
+
+// handleOversizedPacket discards an oversized packet and injects an ICMP Frag Needed.
+// Returns "dropped" if the packet was discarded, an error reason string on read failure, or "" if not oversized.
+func handleOversizedPacket(tunDev *TUNDevice, serverConn net.Conn, remoteIP net.IP, pktLen uint32) string {
+	if pktLen <= uint32(tunDev.mtu) {
+		return ""
+	}
+	log.Debug("Packet too large (%d > MTU %d), dropping and sending ICMP", pktLen, tunDev.mtu)
+	oversized := make([]byte, pktLen)
+	if _, err := io.ReadFull(serverConn, oversized); err != nil {
+		log.Debug("Failed to read oversized packet: %v", err)
+		return fmt.Sprintf("server_read_oversized: %v", err)
+	}
+	icmpPkt := BuildICMPFragNeeded(remoteIP, oversized, uint16(tunDev.mtu))
+	if icmpPkt != nil {
+		if _, err := tunDev.Write(icmpPkt); err != nil {
+			log.Debug("Failed to inject ICMP frag needed: %v", err)
+		}
+	}
+	return "dropped"
+}

@@ -1,0 +1,427 @@
+# Default values for the tiredvpn Helm chart.
+# Server and/or client are turned on by independent toggles:
+#   server.enabled — runs the exit node (Deployment + main TCP/UDP Service + api ClusterIP).
+#   client.enabled + client.mode (socks|tun|both) — runs SOCKS5 proxy and/or TUN DaemonSet.
+
+# ---------------- global ----------------
+global:
+  image:
+    repository: tiredvpn/tiredvpn
+    # Defaults to .Chart.AppVersion; override here.
+    tag: ""
+    pullPolicy: IfNotPresent
+  # List of references to kubernetes.io/dockerconfigjson Secrets.
+  imagePullSecrets: []
+  # [{ name: ghcr-pull }]
+
+# Override resource name; defaults to the release name.
+nameOverride: ""
+fullnameOverride: ""
+
+# A single ServiceAccount is shared by server and client.
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automount: true
+
+# Labels / annotations applied to all pods.
+commonLabels: {}
+commonAnnotations: {}
+
+# =========================================================
+# SERVER
+# =========================================================
+server:
+  enabled: true
+  replicaCount: 1
+
+  # CLI-flag configuration (recommended). If server.tomlConfig is set, this block is ignored.
+  # Fields map to `tiredvpn server` flags (see cmd/tiredvpn/main.go).
+  config:
+    # -listen :443
+    listen: ":443"
+    # -listen-v6 [::]:995
+    listenV6: "[::]:995"
+    ipv6:
+      enabled: true   # -enable-v6
+      dualStack: true # -dual-stack
+    quic:
+      enabled: true             # mapped to -no-quic if false
+      listen: ""                # -quic-listen (empty = default, same port as main)
+      sniReassembly: false      # -quic-sni-reassembly
+    portHopping:
+      enabled: false
+      range: ""                 # -port-range "47000-47100" or "995"
+      maxPorts: 50              # -port-range-max
+      interval: 60s             # -port-hop-interval
+      strategy: random          # -port-hop-strategy: random|sequential|fibonacci
+      seed: ""                  # -port-hop-seed
+    tun:
+      ip: 10.8.0.1              # -tun-ip
+      name: tiredvpn0           # -tun-name
+      ipPool: ""                # -ip-pool "10.8.0.0/24" (enables IP issuance to clients)
+      ipPoolLease: 24h          # -ip-pool-lease
+    upstream:
+      addr: ""                  # -upstream
+      secret: ""                # -upstream-secret (can be sourced via existingSecret)
+      existingSecret: ""
+      existingSecretKey: upstream-secret
+    fakeRoot:
+      # Path inside the container; the image already ships /var/www/html/index.html.
+      path: "./www"             # -fake-root (binary default — ./www)
+      # Inline HTML mounted as a ConfigMap. Empty = use the image's built-in.
+      inline: ""
+    api:
+      enabled: true             # without api there's no /health, /metrics, or admin API
+      listen: ":8080"           # -api-addr (use 0.0.0.0 so it's reachable in-cluster)
+    pprof:
+      enabled: false
+      listen: ":6060"           # -pprof
+    debug: false                # -debug
+
+  # -------- Server TUN / exit-NAT mode --------
+  # When enabled, the server runs as a real exit node: it creates a TUN device,
+  # issues IPs to clients from config.tun.ipPool and NATs their traffic to the WAN.
+  # This requires NET_ADMIN, access to /dev/net/tun and the ability to enable
+  # net.ipv4.ip_forward — none of which the default proxy securityContext allows.
+  #
+  # The binary itself enables ip_forward and installs nftables MASQUERADE/FORWARD
+  # rules for the -ip-pool CIDR on start (auto-detected WAN interface, override
+  # via the TIREDVPN_WAN_IFACE env var) — pure netlink, no iptables/ip binaries,
+  # so the default image (global.image) works here unchanged. NAT is NOT
+  # configured by the chart — it only grants the pod the needed privileges.
+  #
+  # When tun.enabled=false (default) the server stays a plain proxy and the
+  # securityContext / image below are unchanged.
+  tun:
+    enabled: false
+    # Empty = reuse global.image unchanged; the default image already handles
+    # TUN mode. Override only if you want a different image for this pod
+    # specifically (e.g. the alpine `tun` build tag for a debug shell).
+    image:
+      repository: ""          # empty = global.image.repository
+      tag: ""                 # empty = global.image.tag
+      pullPolicy: ""          # empty = global.image.pullPolicy
+    # hostNetwork is recommended for an exit node so MASQUERADE uses the node WAN
+    # and return traffic is routed by the node directly.
+    hostNetwork: true
+    # privileged:true is the simplest path — it lets the binary set sysctls
+    # (net.ipv4.ip_forward) and install nftables rules without extra kubelet
+    # config. privileged:false + capabilities below works only if the kubelet
+    # allows the net.ipv4.ip_forward sysctl (see sysctls note in
+    # server-deployment.yaml) or the binary can already toggle it via NET_ADMIN.
+    privileged: false
+    capabilities:
+      - NET_ADMIN
+      - NET_RAW
+
+  # Alternative to config.* — raw TOML content (see configs/server.example.toml).
+  # When set, mounted at /etc/tiredvpn/server.toml and started as `tiredvpn server -config /etc/tiredvpn/server.toml`.
+  tomlConfig: ""
+
+  tls:
+    # Existing kubernetes.io/tls Secret with tls.crt / tls.key (e.g., issued by cert-manager).
+    existingSecret: ""
+    # Alternative: create a Secret from inline values.
+    create: false
+    cert: ""                    # PEM
+    key: ""                     # PEM
+
+  auth:
+    # secret  → single-client mode (-secret), value from values.secret or existingSecret.
+    # tokens  → multi-client tokens (without Redis you need either tokens-file via TOML or admin API).
+    # external→ neither secret nor tokens are passed in args (use external Redis/API).
+    mode: secret                # secret | tokens | external
+    # Existing Secret with the `secret` key (for mode=secret).
+    existingSecret: ""
+    existingSecretKey: secret
+    # Inline secret.
+    secret: ""
+    # tokens — list of strings (for mode=tokens), mounted as /etc/tiredvpn/tokens.txt.
+    tokens: []
+
+  redis:
+    # Redis address. If empty and .Values.redis.enabled=true — defaulted to {release}-redis-master:6379.
+    # If set — used as-is; the redis subchart should be disabled.
+    addr: ""
+
+  service:
+    main:
+      # Main listener — usually LoadBalancer/NodePort for external access.
+      type: LoadBalancer
+      annotations: {}
+      externalTrafficPolicy: Local
+      loadBalancerIP: ""
+      loadBalancerSourceRanges: []
+      # When type=NodePort and tcpNodePort/udpNodePort are set, bind those node ports.
+      tcpNodePort: ""
+      udpNodePort: ""
+    api:
+      type: ClusterIP
+      port: 8080
+      annotations: {}
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: [ALL]
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+
+  podAnnotations: {}
+  podLabels: {}
+
+  priorityClassName: ""
+
+  # Extra environment variables.
+  extraEnv: []
+  extraEnvFrom: []
+  # Extra volumes / volumeMounts (e.g., for logs).
+  extraVolumes: []
+  extraVolumeMounts: []
+
+  # Extra CLI args. Useful for flags not exposed through config.*.
+  extraArgs: []
+
+  pdb:
+    enabled: false
+    minAvailable: 1
+    # maxUnavailable: ""
+
+  networkPolicy:
+    enabled: false
+    # Extra namespaces allowed to scrape the api port (e.g., for Prometheus).
+    allowedMonitoringNamespaces: []
+    # Extra peers for the main listener (default — world).
+    allowedFromMain:
+      - podSelector: {}
+      - namespaceSelector: {}
+    # ipBlock for the main listener (default — 0.0.0.0/0).
+    allowAllExternal: true
+
+  metrics:
+    serviceMonitor:
+      enabled: false
+      namespace: ""
+      interval: 30s
+      scrapeTimeout: ""
+      labels: {}
+      relabelings: []
+      metricRelabelings: []
+      honorLabels: false
+
+  autoscaling:
+    # Only meaningful when server.redis.addr or .Values.redis.enabled (shared state).
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 0
+
+# =========================================================
+# CLIENT
+# =========================================================
+client:
+  enabled: false
+  # socks → Deployment with SOCKS5 on 0.0.0.0:1080 + ClusterIP Service (reachable by other pods).
+  # tun   → DaemonSet with a TUN tunnel (requires privileged or NET_ADMIN/NET_RAW).
+  # both  → both workloads.
+  mode: socks
+
+  # VPN server address and secret. Can come from existingSecret (keys: address, secret).
+  server:
+    address: ""                 # vpn.example.com:443  (-server)
+    secret: ""                  # (-secret)
+    existingSecret: ""
+    existingSecretAddressKey: address
+    existingSecretSecretKey: secret
+
+  # CLI-flag configuration (recommended). If client.tomlConfig is set, this block is ignored.
+  # Fields map to `tiredvpn client` flags (see cmd/tiredvpn/main.go).
+  config:
+    debug: false                # -debug
+    strategy: ""                # -strategy (empty = auto)
+    cover: ""                   # -cover (empty = binary default api.googleapis.com)
+    fallback: true              # -fallback (default true)
+    quic:
+      enabled: false            # -quic
+      port: 0                   # -quic-port (0 = don't pass, leave default 443)
+      sniFrag: false            # -quic-sni-frag
+    ech:
+      enabled: false            # -ech
+      config: ""                # -ech-config (base64)
+      publicName: ""            # -ech-public-name (empty = binary default)
+    pq:
+      enabled: false            # -pq
+      serverKey: ""             # -pq-server-key (base64)
+    rttMasking:
+      enabled: false            # -rtt-masking
+      profile: ""               # -rtt-profile (empty = default moscow-yandex)
+    ipv6:
+      serverV6: ""              # -server-v6 [2001:db8::1]:995
+      preferV6: true            # -prefer-ipv6 (default true)
+      fallbackV4: true          # -fallback-v4 (default true)
+    portHop:
+      enabled: false            # -port-hop
+      start: 47000              # -port-hop-start
+      end: 65535                # -port-hop-end
+      interval: 60s             # -port-hop-interval
+      strategy: random          # -port-hop-strategy
+      seed: ""                  # -port-hop-seed
+    adaptive:
+      reprobeInterval: ""       # -reprobe-interval (empty = default 5m)
+      circuitThreshold: 0       # -circuit-threshold (0 = don't pass)
+      circuitReset: ""          # -circuit-reset
+    api:
+      enabled: false            # exposes /metrics, /health
+      listen: ":8080"           # -api-addr
+    pprof:
+      enabled: false
+      listen: ":6060"           # -pprof
+
+  # Alternative to config.* — raw TOML content (see configs/client.example.toml).
+  tomlConfig: ""
+
+  # -------- SOCKS5 mode (Deployment) --------
+  socks:
+    replicaCount: 1
+    listen: "0.0.0.0:1080"      # -listen (must be 0.0.0.0 for in-cluster access)
+    httpListen: ""              # -http-listen (optional separate HTTP proxy port)
+    service:
+      type: ClusterIP
+      port: 1080
+      httpPort: 8118
+      annotations: {}
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      runAsGroup: 65532
+      seccompProfile:
+        type: RuntimeDefault
+    securityContext:
+      readOnlyRootFilesystem: true
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: [ALL]
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+    podLabels: {}
+    pdb:
+      enabled: false
+      minAvailable: 1
+
+  # -------- TUN mode (DaemonSet) --------
+  # The client configures the TUN device (creation, IP, routes, MSS clamping)
+  # itself via netlink/nftables — no `ip`/`iptables` binaries needed, so the
+  # default tiredvpn image (FROM scratch, global.image) works unchanged here.
+  # Override image below only if you want a different image for this
+  # DaemonSet specifically (e.g. a debug-shell variant).
+  tun:
+    name: tiredvpn0             # -tun-name
+    ip: 10.8.0.2                # -tun-ip
+    peerIp: 10.8.0.1            # -tun-peer-ip
+    mtu: 1280                   # -tun-mtu
+    routes: "0.0.0.0/0"         # -tun-routes
+    hostNetwork: true
+    # true → privileged: true; false → drop ALL + add NET_ADMIN,NET_RAW.
+    usePrivileged: false
+    # Empty = reuse global.image unchanged.
+    image:
+      repository: ""
+      tag: ""
+      pullPolicy: ""
+    updateStrategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxUnavailable: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 1000m
+        memory: 512Mi
+    nodeSelector:
+      kubernetes.io/os: linux
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+    podLabels: {}
+
+  # Extra env / volumes shared by both modes.
+  extraEnv: []
+  extraEnvFrom: []
+  extraVolumes: []
+  extraVolumeMounts: []
+  extraArgs: []
+
+  metrics:
+    serviceMonitor:
+      enabled: false
+      namespace: ""
+      interval: 30s
+      scrapeTimeout: ""
+      labels: {}
+      relabelings: []
+      metricRelabelings: []
+      honorLabels: false
+
+  networkPolicy:
+    enabled: false
+    # Where SOCKS port traffic is allowed from.
+    allowedClientNamespaces: []
+    allowedClientPodSelectors: []
+    # Where egress is allowed to (default — world; the VPN server is usually public).
+    allowAllEgress: true
+
+# =========================================================
+# REDIS subchart (bitnami)
+# =========================================================
+# Enable for the multi-client server. When redis.enabled=true and
+# server.redis.addr is empty, the server connects to <release>-redis-master:6379.
+redis:
+  enabled: false
+  architecture: standalone
+  auth:
+    # The current tiredvpn server doesn't pass a password to Redis — leave auth off.
+    enabled: false
+  master:
+    persistence:
+      enabled: true
+      size: 1Gi
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi

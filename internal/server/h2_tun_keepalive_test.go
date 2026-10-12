@@ -1,0 +1,73 @@
+package server
+
+import (
+	"bytes"
+	"sync"
+	"testing"
+
+	"golang.org/x/net/http2"
+)
+
+// TestForwardH2TUNKeepaliveEcho verifies that the H2-stego TUN ingest path
+// echoes a client's zero-length keepalive back to the client (so the client's
+// readFromServer deadline resets during idle), matching the morph / confusion /
+// native TUN handlers. Before the fix this path dropped pktLen==0 as "invalid"
+// (pktLen < 20) and idle H2 clients reconnected every readTimeout (~30s).
+func TestForwardH2TUNKeepaliveEcho(t *testing.T) {
+	srvCtx := newTestServerContext(t)
+	logger := testLogger(t)
+
+	// The stego response frame opens with a marker keyed to the client secret,
+	// so the echo path needs a non-empty secret to build a header at all.
+	secret := []byte("keepalive-test-secret-0123456789")
+
+	var out bytes.Buffer
+	framer := http2.NewFramer(&out, nil)
+	var sid uint32 = 1
+	h2c := &h2TunConn{
+		framer:   framer,
+		streamID: &sid,
+		cfg:      srvCtx.cfg,
+		secret:   secret,
+		mu:       &sync.Mutex{},
+	}
+	// A sink must be present to pass the early guard; the keepalive path only
+	// touches UpdateActivity on it, so a no-op sink is enough.
+	tunnel := &h2TunnelState{
+		targetConn: h2c,
+		streamID:   sid,
+		secret:     secret,
+		sink:       &nopTUNSink{},
+	}
+	// Every downstream write on a TUN tunnel goes through the tunnel's frame
+	// gate, which is closed until the handshake response is out; a keepalive
+	// echo before that must not reach the client ahead of the handshake.
+	tunnel.tunGate = newTunFrameGate(func(frame []byte) error {
+		tunnel.mu.Lock()
+		sendStegoResponse(framer, tunnel.streamID, frame, tunnel.secret)
+		tunnel.mu.Unlock()
+		return nil
+	})
+	forwardH2TUNPacket(tunnel, sid, []byte{0, 0, 0, 0}, logger)
+	if out.Len() != 0 {
+		t.Fatalf("keepalive echoed before the handshake response went out: %d bytes", out.Len())
+	}
+	if err := tunnel.tunGate.Open([]byte{0x00}); err != nil {
+		t.Fatalf("open gate: %v", err)
+	}
+	out.Reset()
+
+	// Zero-length keepalive: [len:4 = 0]. Must be echoed back (DATA frame out).
+	forwardH2TUNPacket(tunnel, sid, []byte{0, 0, 0, 0}, logger)
+	if out.Len() == 0 {
+		t.Fatal("zero-length keepalive was not echoed back to client")
+	}
+
+	// A short non-keepalive frame (1 <= pktLen < 20) is still invalid and must
+	// NOT be echoed — only pktLen==0 is a keepalive.
+	out.Reset()
+	forwardH2TUNPacket(tunnel, sid, []byte{0, 0, 0, 5, 1, 2, 3, 4, 5}, logger)
+	if out.Len() != 0 {
+		t.Fatalf("short invalid packet should produce no output, got %d bytes", out.Len())
+	}
+}

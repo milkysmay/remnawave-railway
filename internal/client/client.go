@@ -1,0 +1,1583 @@
+package client
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/tiredvpn/tiredvpn/internal/benchmark"
+	"github.com/tiredvpn/tiredvpn/internal/endpoint"
+	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/pool"
+	"github.com/tiredvpn/tiredvpn/internal/porthopping"
+	"github.com/tiredvpn/tiredvpn/internal/protect"
+	"github.com/tiredvpn/tiredvpn/internal/shaper"
+	"github.com/tiredvpn/tiredvpn/internal/strategy"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
+	"github.com/tiredvpn/tiredvpn/internal/tun"
+)
+
+var (
+	Version   = "1.11.5"
+	BuildTime = "unknown"
+
+	// Global metrics instance (nil if metrics disabled)
+	clientMetrics *ClientMetrics
+)
+
+// Config holds client configuration
+type Config struct {
+	ListenAddr     string
+	HTTPListenAddr string // Separate HTTP proxy port (optional)
+	ServerAddr     string
+	Secret         string
+	CoverHost      string
+	StrategyName   string
+	Debug          bool
+
+	// IPv6 Transport
+	ServerAddrV6 string // IPv6 server address (e.g., "[2001:db8::100]:995")
+	PreferIPv6   bool   // Prefer IPv6 transport if available (default: true)
+	FallbackToV4 bool   // Fallback to IPv4 if IPv6 fails (default: true)
+
+	// Servers is the configured endpoint list ([[servers]] in the TOML). When
+	// it is empty the client falls back to the single ServerAddr/ServerAddrV6
+	// pair above, which is what a unit started with nothing but -server has.
+	//
+	// ServerAddr/ServerAddrV6 stay authoritative for everything that reads a
+	// single address: ResolveEndpoints keeps them equal to the first entry.
+	Servers []ServerSpec
+
+	// Selection tunes which endpoint gets dialled and how long a failed one is
+	// parked. The zero value means "legacy behaviour": family from
+	// PreferIPv6/FallbackToV4, defaults for everything else.
+	Selection SelectionSpec
+
+	// TUN mode
+	TunMode   bool
+	TunName   string
+	TunIP     string
+	TunPeerIP string
+	TunMTU    int
+	TunRoutes string
+	AutoMTU   bool // active end-to-end MTU probe; TunMTU becomes the upper bound (cap)
+
+	// TunIPv6Policy is the -tun-ipv6 value ("off" default, "dual" to route
+	// IPv6 through the tunnel when the exit negotiates dual-stack). Parsed
+	// via tun.ParseIPv6Policy in newTUNVPNConfig.
+	TunIPv6Policy string
+
+	// TunIPv6Allow is the -tun-ipv6-allow value: a comma-separated list of
+	// interface names and IPv6 prefixes the leak block must leave alone, in
+	// the same raw form TunRoutes has. Parsed via tun.ParseIPv6AllowList in
+	// newTUNVPNConfig. Empty means no exceptions, the historical behaviour.
+	TunIPv6Allow string
+
+	// TunRoutes6 is the -tun-routes6 value: which IPv6 destinations the tunnel
+	// claims once dual-stack is negotiated, in the same raw comma-separated
+	// form TunRoutes has, plus the literal "none" for no destination at all.
+	// Empty means the ::/1 + 8000::/1 half-defaults, the historical behaviour.
+	// Parsed via tun.ParseIPv6Routes in newTUNVPNConfig.
+	TunRoutes6 string
+
+	// Host-supplied TUN integration (Android VpnService / macOS NetworkExtension).
+	// In both modes the TUN fd is created by the host and passed in via TunFd;
+	// the host (not Go) also owns route/DNS/firewall setup.
+	TunFd         int    // Use existing TUN file descriptor
+	ProtectPath   string // Unix socket path for protect() calls (Android only)
+	ProtectProto  int    // protect channel protocol the app speaks (-protect-proto); 2 = SCM_RIGHTS, else 1
+	ControlSocket string // Control socket path for host<->Go command channel
+	AndroidMode   bool   // Running on Android (disables os/exec, ICMP checks, etc.)
+	MacOSMode     bool   // Running on macOS inside NEPacketTunnelProvider (same shape as AndroidMode minus protect)
+
+	// Modes
+	ListStrategies     bool
+	BenchmarkMode      bool
+	BenchmarkJSONMode  bool // Output benchmark results as JSON (for automation)
+	FullBenchmarkMode  bool
+	BenchmarkAllCombos bool // Test all strategy + RTT profile combinations
+
+	// Adaptive strategy config
+	ReprobeInterval  time.Duration // How often to re-probe strategies (default 5m)
+	CircuitThreshold int           // Failures before circuit opens (default 3)
+	CircuitResetTime time.Duration // Time before circuit tries half-open (default 5m)
+	EnableFallback   bool          // Enable mid-session fallback (default true)
+
+	// QUIC transport
+	QUICEnabled bool // Enable QUIC strategy
+	QUICPort    int  // QUIC server port (default 8443)
+
+	// ICMP tunnel (backup transport, requires CAP_NET_RAW)
+	ICMPTunnelEnabled bool // Enable ICMP tunnel strategy
+
+	// Seqovl level-A packet overlap (Linux + CAP_NET_ADMIN, off by default)
+	SeqovlPacketEnabled bool // Enable packet-level TCP sequence overlap
+
+	// REALITYRequireDataV2 refuses servers still on the v1 REALITY data layer
+	// instead of falling back to it. Off until every server is upgraded.
+	REALITYRequireDataV2 bool
+
+	// BurstReshape turns on the nudge/ack exchange that splits the inner TLS
+	// handshake. Must match the server's -burst-reshape, and the pad value must
+	// match too; a one-sided setting corrupts streams.
+	BurstReshape string
+
+	// BurstReshapePadFlight must equal the server's -burst-reshape-pad-flight.
+	BurstReshapePadFlight int
+
+	// REALITYServerPubKey is the server's static X25519 public key, base64.
+	// A non-empty value means "speak B1 to this server" - there is no probing
+	// and no downgrade on error, because a transport that falls back when the
+	// handshake fails is a transport a censor can force back to the old one.
+	// It also anchors the certificate HMAC check that authenticates the server
+	// without a CA once B1.5 lands.
+	//
+	// The key is public: it ships alongside the secret because that channel
+	// already exists, not because it needs protecting.
+	REALITYServerPubKey string
+
+	// RTT Masking
+	RTTMaskingEnabled bool   // Enable RTT masking
+	RTTProfile        string // RTT profile name
+
+	// TLSFingerprint names the uTLS browser profile used for ClientHellos.
+	// Empty means the built-in default (see internal/tls.DefaultFingerprintName).
+	TLSFingerprint string
+
+	// ECH (Encrypted Client Hello) - hides SNI from DPI
+	ECHEnabled    bool   // Enable ECH
+	ECHConfigB64  string // ECHConfigList in base64 (from server)
+	ECHPublicName string // Outer SNI visible to DPI (e.g., "cloudflare-ech.com")
+
+	// QUIC SNI fragmentation for GFW bypass
+	QUICSNIFragEnabled bool // Fragment SNI in QUIC CRYPTO frames
+
+	// Post-Quantum crypto
+	PQEnabled         bool   // Enable ML-KEM-768 + ML-DSA-65
+	PQServerKemPubB64 string // Server's Kyber768 public key in base64
+
+	// API/Metrics
+	APIAddr string // API/Metrics HTTP endpoint (e.g., :8080)
+
+	// Port hopping for DPI evasion
+	PortHoppingEnabled bool          // Enable port hopping
+	PortHopRangeStart  int           // Start of port range (default: 47000)
+	PortHopRangeEnd    int           // End of port range (default: 65535)
+	PortHopInterval    time.Duration // Hop interval (default: 60s)
+	PortHopStrategy    string        // Strategy: random, sequential, fibonacci
+	PortHopSeed        string        // Seed for deterministic hopping (optional)
+
+	// Shaper, when non-nil, is forwarded to the strategy manager and drives
+	// MorphedConn behaviour. Built from TOML [shaper] in cmd/tiredvpn.
+	Shaper shaper.Shaper
+
+	// ShaperID is the negotiation byte advertised to the server so it can
+	// reconstruct the same framing. Set alongside Shaper from the preset name.
+	ShaperID byte
+}
+
+// Run starts the client with the given configuration
+func Run(cfg *Config) error {
+	if cfg.ListStrategies {
+		return listStrategies(cfg)
+	}
+
+	// Resolve the endpoint list before anything reads cfg.ServerAddr: it is
+	// ResolveEndpoints that fills that field from the first entry when the
+	// client was configured with a [[servers]] list. It may also adopt a
+	// secret carried by the config, so it has to run before resolveSecret.
+	eps, err := ResolveEndpoints(cfg)
+	if err != nil {
+		return err
+	}
+
+	secret := resolveSecret(cfg)
+
+	if cfg.Debug {
+		log.SetDebug(true)
+	}
+	if cfg.AndroidMode || cfg.MacOSMode {
+		// Both modes run inside a host-managed sandbox: no raw sockets, no ICMP,
+		// no os/exec for routes. The strategy package gates these behind one flag.
+		strategy.SetAndroidMode(true)
+	}
+
+	applyAdaptiveDefaults(cfg)
+
+	log.Info("tiredvpn client %s starting...", Version)
+	log.Info("Server: %s, Cover: %s", cfg.ServerAddr, cfg.CoverHost)
+	if len(eps) > 1 {
+		for i, e := range eps {
+			log.Info("  endpoint %d: %s v4=%q v6=%q", i, e.Label(i), e.V4, e.V6)
+		}
+	}
+	// No "Listening on ..." here. This runs before any listener exists, and
+	// four of the modes dispatched below (the benchmarks) never open one at
+	// all; the claim is made where the socket is, in startProxy.
+	log.Info("Adaptive config: reprobe=%v, circuitThreshold=%d, circuitReset=%v, fallback=%v",
+		cfg.ReprobeInterval, cfg.CircuitThreshold, cfg.CircuitResetTime, cfg.EnableFallback)
+
+	mgr, err := buildManager(cfg, secret)
+	if err != nil {
+		return err
+	}
+
+	logEnabledFeatures(cfg, mgr)
+
+	if cfg.Debug {
+		fmt.Fprintln(os.Stderr, mgr.PrintStrategySummary())
+	}
+
+	if cfg.BenchmarkMode {
+		return runBenchmark(cfg, mgr)
+	}
+	if cfg.BenchmarkJSONMode {
+		return runBenchmarkJSON(cfg, mgr)
+	}
+	if cfg.FullBenchmarkMode {
+		return runFullBenchmark(cfg, mgr)
+	}
+	if cfg.BenchmarkAllCombos {
+		return runAllCombosBenchmark(cfg, mgr)
+	}
+
+	mgr.SetReprobeInterval(cfg.ReprobeInterval)
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	if cfg.ControlSocket != "" {
+		return runControlSocketMode(cfg, mgr, sigChan)
+	}
+
+	return runProbeAndServe(cfg, mgr, sigChan)
+}
+
+// listStrategies prints available strategy IDs and exits.
+func listStrategies(cfg *Config) error {
+	mgrCfg := strategy.DefaultManagerConfig{
+		ServerAddr: "example.com:443",
+		Secret:     []byte("dummy"),
+		CoverHost:  cfg.CoverHost,
+	}
+	mgr := strategy.NewDefaultManager(mgrCfg)
+	fmt.Println(mgr.PrintStrategySummary())
+	fmt.Println("\nStrategy IDs for -strategy flag:")
+	fmt.Println("  http2_stego    - HTTP/2 Steganography")
+	fmt.Println("  morph          - Traffic Morphing (YouTube)")
+	fmt.Println("  confusion      - Protocol Confusion (DNS/TLS)")
+	fmt.Println("  antiprobe      - Anti-Probe Resistance")
+	return nil
+}
+
+// resolveSecret returns the effective default secret: from cfg, env, or the
+// insecure placeholder. It is the key for every endpoint that does not carry one
+// of its own; endpoints that do are authenticated with theirs (see
+// reconcileSecrets and internal/strategy/secret.go).
+func resolveSecret(cfg *Config) string {
+	s := defaultSecret(cfg)
+	if s == "" {
+		log.Warn("No secret provided - using default (INSECURE!)")
+		s = "default-secret-change-me"
+	}
+	return s
+}
+
+// applyAdaptiveDefaults fills zero-value adaptive config fields with sensible defaults.
+func applyAdaptiveDefaults(cfg *Config) {
+	if cfg.ReprobeInterval == 0 {
+		cfg.ReprobeInterval = 5 * time.Minute
+	}
+	if cfg.CircuitThreshold == 0 {
+		cfg.CircuitThreshold = 3
+	}
+	if cfg.CircuitResetTime == 0 {
+		cfg.CircuitResetTime = 5 * time.Minute
+	}
+}
+
+// buildManager constructs and configures the strategy manager.
+func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
+	// Resolved here rather than passed in: RunWithContext (Android/macOS) and
+	// Run are separate entry points, and a parameter would let one of them
+	// build a manager whose endpoints disagree with cfg.ServerAddr.
+	eps, err := ResolveEndpoints(cfg)
+	if err != nil {
+		return nil, err
+	}
+	selCfg, err := selectorConfig(cfg, eps)
+	if err != nil {
+		return nil, err
+	}
+
+	rttProfile := resolveRTTProfile(cfg)
+	echConfigList := decodeECHConfig(cfg)
+	portHoppingCfg := buildPortHoppingConfig(cfg)
+
+	mgrCfg := strategy.DefaultManagerConfig{
+		ServerAddr:             cfg.ServerAddr,
+		Secret:                 []byte(secret),
+		CoverHost:              cfg.CoverHost,
+		ServerAddrV6:           cfg.ServerAddrV6,
+		PreferIPv6:             cfg.PreferIPv6,
+		FallbackToV4:           cfg.FallbackToV4,
+		Endpoints:              eps,
+		RTTMaskingEnabled:      cfg.RTTMaskingEnabled,
+		RTTProfile:             rttProfile,
+		QUICEnabled:            cfg.QUICEnabled,
+		QUICPort:               cfg.QUICPort,
+		ICMPTunnelEnabled:      cfg.ICMPTunnelEnabled,
+		SeqovlPacketEnabled:    cfg.SeqovlPacketEnabled,
+		TLSFingerprint:         cfg.TLSFingerprint,
+		REALITYServerPubKeyB64: cfg.REALITYServerPubKey,
+		ECHEnabled:             cfg.ECHEnabled,
+		ECHConfigList:          echConfigList,
+		ECHPublicName:          cfg.ECHPublicName,
+		QUICSNIFragEnabled:     cfg.QUICSNIFragEnabled,
+		PQEnabled:              cfg.PQEnabled,
+		PQServerKemPubB64:      cfg.PQServerKemPubB64,
+		AndroidMode:            cfg.AndroidMode || cfg.MacOSMode,
+		PortHopping:            portHoppingCfg,
+		Shaper:                 cfg.Shaper,
+		ShaperID:               cfg.ShaperID,
+
+		REALITYRequireDataV2: cfg.REALITYRequireDataV2,
+		BurstReshape: strategy.BurstReshapeConfig{
+			Enabled:   cfg.BurstReshape == "on",
+			PadFlight: cfg.BurstReshapePadFlight,
+		},
+	}
+	mgr := strategy.NewDefaultManager(mgrCfg)
+
+	// The constructor already built a selector from mgrCfg; this replaces it
+	// with one that also carries the [selection] tuning (family policy,
+	// failure threshold, cooldown, dwell). Building a selector costs no I/O,
+	// so the second pass is a rebuild of a value, not a second dial.
+	if err := mgr.SetEndpointSelection(selCfg); err != nil {
+		return nil, fmt.Errorf("server selection: %w", err)
+	}
+	// The authoritative line: initManagerTransport logs the family it derived
+	// from the legacy flags, which an explicit selection.family overrides.
+	log.Info("Endpoint selection: %d endpoint(s), family=%s, policy=%s",
+		len(eps), selCfg.Family, selectionPolicyName(cfg.Selection.Policy))
+
+	connectivityChecker := strategy.NewConnectivityChecker(cfg.ServerAddr, 3*time.Second, cfg.AndroidMode || cfg.MacOSMode)
+	// With both families configured the gate must accept either, or a client
+	// whose IPv4 is blocked (and whose IPv6 transport works fine) never gets
+	// past "waiting for network" - the manager dials v6 while the gate probes
+	// the dead v4. Connect re-points the gate at the pinned candidate on every
+	// cycle; this is the starting position.
+	connectivityChecker.SetAddrs(cfg.ServerAddr, cfg.ServerAddrV6)
+	mgr.SetConnectivityChecker(connectivityChecker)
+	log.Debug("Connectivity checker initialized for %s (alt=%q)", cfg.ServerAddr, cfg.ServerAddrV6)
+
+	if cfg.StrategyName != "" {
+		log.Info("Forcing strategy: %s", cfg.StrategyName)
+		if err := mgr.ForceStrategy(cfg.StrategyName); err != nil {
+			return nil, fmt.Errorf("unknown strategy: %s (available: %s)", cfg.StrategyName, mgr.ListStrategyIDs())
+		}
+	}
+	return mgr, nil
+}
+
+// resolveRTTProfile looks up the named RTT profile, returning nil if not found.
+func resolveRTTProfile(cfg *Config) *strategy.RTTProfile {
+	if !cfg.RTTMaskingEnabled || cfg.RTTProfile == "" {
+		return nil
+	}
+	p := strategy.GetRTTProfile(cfg.RTTProfile)
+	if p == nil {
+		log.Warn("Unknown RTT profile '%s', using default (moscow-yandex)", cfg.RTTProfile)
+		return strategy.MoscowToYandexProfile
+	}
+	return p
+}
+
+// decodeECHConfig base64-decodes the ECH config list, disabling ECH on failure.
+func decodeECHConfig(cfg *Config) []byte {
+	if !cfg.ECHEnabled || cfg.ECHConfigB64 == "" {
+		return nil
+	}
+	b, err := base64.StdEncoding.DecodeString(cfg.ECHConfigB64)
+	if err != nil {
+		log.Warn("Failed to decode ECH config: %v (ECH disabled)", err)
+		cfg.ECHEnabled = false
+		return nil
+	}
+	return b
+}
+
+// buildPortHoppingConfig creates a validated port-hopping config, or nil if disabled/invalid.
+func buildPortHoppingConfig(cfg *Config) *porthopping.Config {
+	if !cfg.PortHoppingEnabled {
+		return nil
+	}
+	phCfg := &porthopping.Config{
+		Enabled:        true,
+		PortRangeStart: cfg.PortHopRangeStart,
+		PortRangeEnd:   cfg.PortHopRangeEnd,
+		HopInterval:    cfg.PortHopInterval,
+		Strategy:       porthopping.Strategy(cfg.PortHopStrategy),
+		Seed:           []byte(cfg.PortHopSeed),
+	}
+	if err := phCfg.Validate(); err != nil {
+		log.Warn("Invalid port hopping config: %v (disabled)", err)
+		return nil
+	}
+	return phCfg
+}
+
+// logEnabledFeatures logs info lines for each optional feature that is active.
+func logEnabledFeatures(cfg *Config, mgr *strategy.Manager) {
+	// Always logged, not gated on a flag: which browser we are pretending to be
+	// is the single most consequential thing about how we look on the wire, and
+	// an operator debugging a block needs it in the log without extra verbosity.
+	if fp, ok := customtls.LookupFingerprint(cfg.TLSFingerprint); ok {
+		log.Info("TLS fingerprint: %s", fp.Name)
+	}
+	if cfg.RTTMaskingEnabled {
+		log.Info("RTT masking enabled (profile=%s)", cfg.RTTProfile)
+	}
+	if cfg.QUICEnabled {
+		log.Info("QUIC transport enabled (port=%d)", cfg.QUICPort)
+	}
+	if cfg.ECHEnabled {
+		log.Info("ECH enabled (outer SNI: %s)", cfg.ECHPublicName)
+	}
+	if cfg.QUICSNIFragEnabled {
+		log.Info("QUIC SNI fragmentation enabled (GFW bypass)")
+	}
+	if cfg.PQEnabled {
+		log.Info("Post-quantum crypto enabled (ML-KEM-768 + ML-DSA-65)")
+	}
+	if cfg.ServerAddrV6 != "" && cfg.PreferIPv6 {
+		log.Info("IPv6 transport enabled (IPv6=%s, IPv4=%s, fallback=%v)",
+			cfg.ServerAddrV6, cfg.ServerAddr, cfg.FallbackToV4)
+	}
+	// log port hopping status if manager has a port hopper configured
+	_ = mgr // used for future per-strategy logging
+}
+
+// runBenchmark runs the parallel strategy probe benchmark and prints results.
+func runBenchmark(cfg *Config, mgr *strategy.Manager) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	log.Info("Running strategy benchmark...")
+	result := benchmark.ParallelProbe(ctx, mgr, cfg.ServerAddr)
+	fmt.Println(benchmark.FormatResults(result, false))
+	return nil
+}
+
+// runBenchmarkJSON runs the parallel strategy probe and writes results as JSON to stdout.
+// Log output is redirected to stderr so stdout contains only the JSON payload.
+func runBenchmarkJSON(cfg *Config, mgr *strategy.Manager) error {
+	log.SetOutput(os.Stderr)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	result := benchmark.ParallelProbe(ctx, mgr, cfg.ServerAddr)
+	report := benchmark.ToJSONReport(result, cfg.ServerAddr, Version)
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(report)
+}
+
+// runFullBenchmark runs the full HTTP/latency/speed/IP-change benchmark and prints results.
+func runFullBenchmark(cfg *Config, mgr *strategy.Manager) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	log.Info("Running FULL strategy benchmark (this may take several minutes)...")
+	log.Info("Testing %d strategies for: HTTP, latency, speed, IP change", len(mgr.GetOrderedStrategies()))
+	origIP, err := benchmark.GetOriginalIP(ctx)
+	if err != nil {
+		log.Warn("Could not get original IP: %v (IP change detection disabled)", err)
+		origIP = "unknown"
+	} else {
+		log.Info("Original IP: %s", origIP)
+	}
+	result := benchmark.RunFullBenchmarkDirect(ctx, mgr, cfg.ServerAddr, origIP)
+	fmt.Println(benchmark.FormatFullResults(result))
+	return nil
+}
+
+// runAllCombosBenchmark runs the exhaustive strategies × RTT profiles benchmark.
+func runAllCombosBenchmark(cfg *Config, mgr *strategy.Manager) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	rttProfiles := strategy.AllRTTProfiles()
+	strategies := mgr.GetOrderedStrategies()
+	totalCombos := len(strategies) * (1 + len(rttProfiles))
+	log.Info("Running EXHAUSTIVE benchmark of ALL combinations...")
+	log.Info("Strategies: %d, RTT profiles: %d (+none), Total combinations: %d",
+		len(strategies), len(rttProfiles), totalCombos)
+	origIP, err := benchmark.GetOriginalIP(ctx)
+	if err != nil {
+		log.Warn("Could not get original IP: %v", err)
+		origIP = "unknown"
+	} else {
+		log.Info("Original IP: %s", origIP)
+	}
+	result := benchmark.RunAllCombinationsBenchmark(ctx, mgr, cfg.ServerAddr, origIP, rttProfiles)
+	fmt.Println(benchmark.FormatAllCombosResults(result))
+	return nil
+}
+
+// runProbeAndServe probes strategies then starts proxy/TUN serving.
+func runProbeAndServe(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	log.Info("Probing strategies...")
+	results := mgr.ProbeAll(ctx, cfg.ServerAddr)
+	cancel()
+
+	available := 0
+	for _, r := range results {
+		if r.Success {
+			available++
+			log.Debug("Strategy available: %s (latency=%v)", r.Strategy.Name(), r.Latency)
+		}
+	}
+	log.Info("Available strategies: %d/%d", available, len(results))
+
+	reprobeCtx, reprobeCancel := context.WithCancel(context.Background())
+	// The reprobe resolves the address itself, per cycle. Passing cfg.ServerAddr
+	// blindly re-probed IPv4 every interval on a client running over IPv6, so
+	// each round measured a path the tunnel does not use - and a value captured
+	// once at start-up goes stale the moment the client falls back to the other
+	// family.
+	mgr.StartPeriodicReprobe(reprobeCtx)
+
+	if cfg.PortHoppingEnabled {
+		mgr.StartPortHopChecker(reprobeCtx)
+	}
+
+	defer func() {
+		reprobeCancel()
+		mgr.StopPeriodicReprobe()
+		mgr.StopPortHopChecker()
+	}()
+
+	if cfg.TunMode {
+		return runTUNMode(cfg, mgr, sigChan)
+	}
+	return runProxyMode(cfg, mgr, sigChan)
+}
+
+// initProtector selects the protect protocol the app asked for
+// (-protect-proto) and connects the protector. Both have to happen before the
+// first dial.
+func initProtector(cfg *Config) {
+	protect.SetProtocol(cfg.ProtectProto)
+	if cfg.ProtectPath == "" {
+		return
+	}
+	if err := tun.InitAndroidProtector(cfg.ProtectPath); err != nil {
+		log.Warn("Socket protector init failed: %v (connections may not work)", err)
+	}
+}
+
+// runControlSocketMode runs in Android control socket mode
+// Android app connects to socket, sends "connect", gets IP, creates VPN interface, sends fd
+func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) error {
+	log.Info("Starting control socket mode on %s", cfg.ControlSocket)
+
+	// Initialize Android socket protector if protect path is provided
+	// This allows strategies to protect sockets from VPN routing
+	initProtector(cfg)
+
+	// IPv6 inside the tunnel: -tun-ipv6 dual opts the control-socket path into
+	// the v0x04 dual-stack handshake, same policy parser as desktop TUN mode.
+	// Default off keeps the handshake byte-identical to pre-dual-stack cores.
+	dualStack, err := parseTunIPv6Policy(cfg.TunIPv6Policy)
+	if err != nil {
+		return err
+	}
+
+	// Create control server with connect function
+	ctrlCfg := &tun.ControlConfig{
+		ServerAddr: cfg.ServerAddr,
+		Secret:     cfg.Secret,
+		MTU:        cfg.TunMTU,
+		DNS:        "8.8.8.8", // Default DNS
+		Routes:     cfg.TunRoutes,
+		DualStack:  dualStack,
+
+		// ReconnectFn - called on network change (WiFi→LTE, cell handoff)
+		// Resets circuit breakers and uses optimized fast reconnect
+		// Must send TUN handshake with current IP so server knows this is a TUN session
+		ReconnectFn: func(ctx context.Context, currentIP net.IP, mtu int) (tun.ReconnectResult, error) {
+			return reconnectTUN(ctx, mgr, cfg.ServerAddr, currentIP, mtu, dualStack)
+		},
+
+		// Connect function - connects to server, returns assigned IP
+		ConnectFn: func(ctx context.Context) (assignedIP, serverIP net.IP, conn net.Conn, err error) {
+			// Connect to server via strategy
+			serverConn, strat, err := mgr.Connect(ctx, cfg.ServerAddr)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("failed to connect: %w", err)
+			}
+
+			log.Info("Connected via %s, waiting for TUN fd from Android", strat.Name())
+
+			// Return connection WITHOUT TUN handshake
+			// TUN handshake will be done AFTER Android creates VPN interface and sends FD
+			// This fixes the "handshake read failed: EOF" error
+			// Use placeholder IPs (10.9.0.2/10.9.0.1) - real IPs will be set after handshake
+			// NOTE: 0.0.0.0 causes Android to fail VPN interface creation
+			placeholderClient := net.IPv4(10, 9, 0, 2)
+			placeholderServer := net.IPv4(10, 9, 0, 1)
+			return placeholderClient, placeholderServer, serverConn, nil
+		},
+
+		// GetConnectionInfoFn returns connection metadata for Android UI
+		GetConnectionInfoFn: func() tun.ConnectionMetadata {
+			info := mgr.GetLastConnectionInfo()
+			return tun.ConnectionMetadata{
+				Strategy:  info.Strategy,
+				LatencyMs: info.Latency.Milliseconds(),
+				Attempts:  info.Attempts,
+			}
+		},
+
+		// StartVPNFn is NOT set - let control.go use the default path
+		// which includes RunTUNRelayWithCallbacks with keepalive events
+		// and dead connection detection
+	}
+
+	ctrlServer, err := tun.NewControlServer(cfg.ControlSocket, ctrlCfg)
+	if err != nil {
+		return fmt.Errorf("failed to create control server: %w", err)
+	}
+	defer ctrlServer.Close()
+
+	// Run in background
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		if err := ctrlServer.Run(ctx); err != nil {
+			log.Warn("Control server error: %v", err)
+		}
+	}()
+
+	// Wait for signal
+	sig := <-sigChan
+	log.Info("Received signal %v, shutting down...", sig)
+	cancel()
+
+	return nil
+}
+
+// parseTunIPv6Policy resolves the -tun-ipv6 flag value ("", "off", "dual")
+// to whether the dual-stack TUN handshake is enabled. An empty value means
+// the flag was never set and behaves like "off"; anything the shared policy
+// parser rejects is an error here too.
+func parseTunIPv6Policy(flagValue string) (bool, error) {
+	if flagValue == "" {
+		flagValue = "off"
+	}
+	policy, err := tun.ParseIPv6Policy(flagValue)
+	if err != nil {
+		return false, err
+	}
+	return policy == tun.IPv6PolicyDual, nil
+}
+
+// reconnectTUN is the control server's ReconnectFn: it redials through the
+// strategy manager after a network change and re-runs the TUN handshake with
+// the client's current IP so the exit restores the session. The conn it hands
+// back is the one the handshake reader returned, which the relay must read
+// from (it may carry the first byte of the first frame).
+func reconnectTUN(ctx context.Context, mgr *strategy.Manager, serverAddr string, currentIP net.IP, mtu int, dualStack bool) (tun.ReconnectResult, error) {
+	log.Info("Network change reconnect triggered (current IP: %s)", currentIP)
+
+	// Reset all circuit breakers and confidences - old network state is invalid
+	mgr.ResetForNetworkChange()
+
+	// Use optimized reconnect with shorter timeouts
+	conn, strat, err := mgr.ConnectForReconnect(ctx, serverAddr)
+	if err != nil {
+		return tun.ReconnectResult{}, err
+	}
+
+	log.Info("Network change reconnect successful via %s, sending TUN handshake", strat.Name())
+
+	// Send TUN mode handshake with our current IP
+	// Server will recognize us and restore the session
+	// The response read is bounded by the reconnect's own context when it has
+	// a deadline (zero lets the reader apply its default).
+	tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, err := reconnectHandshake(ctx, conn, currentIP, mtu, dualStack)
+	if err != nil {
+		conn.Close()
+		return tun.ReconnectResult{}, err
+	}
+
+	log.Info("Reconnect handshake complete (server: %s, assigned: %s)", serverIP, assignedIP)
+
+	return tun.ReconnectResult{
+		Conn:        tunnelConn,
+		ServerIP:    serverIP,
+		AssignedIP:  assignedIP,
+		ServerIP6:   serverIP6,
+		AssignedIP6: assignedIP6,
+	}, nil
+}
+
+// reconnectHandshake runs sendReconnectHandshake so that cancelling ctx ends
+// it. The response read is bounded by ctx's deadline (none: the reader's
+// default), not by ctx itself, so a cancelled ctx - the control server
+// closing - closes conn to cut the read short. On error the caller closes
+// conn.
+func reconnectHandshake(ctx context.Context, conn net.Conn, currentIP net.IP, mtu int, dualStack bool) (tunnelConn net.Conn, serverIP, assignedIP, serverIP6, assignedIP6 net.IP, err error) {
+	deadline, _ := ctx.Deadline()
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, err = sendReconnectHandshake(conn, currentIP, mtu, dualStack, deadline)
+	if !stop() {
+		return nil, nil, nil, nil, nil, fmt.Errorf("reconnect handshake interrupted: %w", context.Cause(ctx))
+	}
+	return tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, err
+}
+
+// sendReconnectHandshake performs the TUN mode handshake on a fresh reconnect
+// connection, sending the client's current IP so the server can restore the
+// session. dualStack selects the version byte: v0x04 when -tun-ipv6 dual is
+// active (re-negotiating IPv6 on reconnect too), otherwise the historical
+// v0x03.
+//
+// tunnelConn is the conn the relay must read from afterwards: the handshake
+// reader may hand the first byte of the first frame back through it. deadline
+// bounds the response read (zero: the reader's default) and is cleared again,
+// so tunnelConn carries no read deadline.
+//
+// serverIP6/assignedIP6 carry the re-negotiated dual-stack pair and are both
+// nil when the exit did not offer IPv6 on this reconnect. The caller has to
+// propagate them: the exit derives the client v6 from the v4 lease, so a new
+// v4 silently implies a new v6, and a host-owned interface cannot recompute it.
+func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack bool, deadline time.Time) (tunnelConn net.Conn, serverIP, assignedIP, serverIP6, assignedIP6 net.IP, err error) {
+	version := byte(0x03) // Version 3: full port hopping config + auto-MTU probe
+	if dualStack {
+		version = 0x04 // Version 4: + dual-stack IPv6 negotiation
+	}
+	handshake := make([]byte, 8)
+	handshake[0] = 0x02 // TUN mode
+	copy(handshake[1:5], currentIP.To4())
+	binary.BigEndian.PutUint16(handshake[5:7], uint16(mtu))
+	handshake[7] = version
+
+	if _, err := conn.Write(handshake); err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("handshake write failed: %w", err)
+	}
+
+	// Read the response for the version just sent: exactly the response
+	// (flags byte, port-hop layout, dual-stack block) and nothing past it, so
+	// the relay that follows starts frame-aligned. The returned conn is the
+	// one the relay must read from, since it may carry the first byte of the
+	// first frame.
+	var resp []byte
+	resp, tunnelConn, err = tun.ReadTUNHandshakeResponse(conn, version, deadline)
+	if err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("handshake read failed: %w", err)
+	}
+	n := len(resp)
+	if n < 9 {
+		return nil, nil, nil, nil, nil, fmt.Errorf("handshake response too short: %d bytes", n)
+	}
+
+	if resp[0] != 0x00 {
+		return nil, nil, nil, nil, nil, fmt.Errorf("server rejected reconnect: status=%d", resp[0])
+	}
+
+	serverIP = net.IP(resp[1:5])
+	assignedIP = net.IP(resp[5:9])
+
+	if dualStack {
+		if caps, ok := tun.ParseTUNHandshakeCapabilities(resp[:n]); ok && caps.DualStackEnabled {
+			serverIP6, assignedIP6 = caps.ServerIP6, caps.ClientIP6
+			log.Info("Reconnect re-negotiated dual-stack: client=%s server=%s", assignedIP6, serverIP6)
+		} else {
+			log.Warn("Dual-stack requested but the exit did not negotiate IPv6 on reconnect; continuing IPv4-only")
+		}
+	}
+
+	return tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, nil
+}
+
+// newTUNVPNConfig maps the client config onto the TUN layer's VPNConfig.
+//
+// Its own function rather than a block inside runTUNMode because everything it
+// does is a mapping that can be wrong quietly: a flag parsed correctly and then
+// not carried into the struct behaves exactly like a flag that was never
+// passed.
+func newTUNVPNConfig(cfg *Config, mgr *strategy.Manager) (tun.VPNConfig, error) {
+	// IPv6 policy: dual (the default) opts into the v0x04 dual-stack handshake
+	// and blocks outbound IPv6 when the exit declines it; off keeps the tunnel
+	// v4-only and leaves host IPv6 alone. Empty means the flag was never set -
+	// which is the case for a client configured purely through TOML, since the
+	// schema has no key for this yet, so the default has to be named here too.
+	ipv6Policy := tun.DefaultIPv6Policy
+	if cfg.TunIPv6Policy != "" {
+		ipv6Policy = cfg.TunIPv6Policy
+	}
+	policy, err := tun.ParseIPv6Policy(ipv6Policy)
+	if err != nil {
+		return tun.VPNConfig{}, err
+	}
+
+	// Exceptions to that block. A bad prefix here fails the start: it can only
+	// be a typo, and a client that ran anyway would leave the operator with a
+	// hole they believe is open.
+	ipv6Allow, err := tun.ParseIPv6AllowList(cfg.TunIPv6Allow)
+	if err != nil {
+		return tun.VPNConfig{}, err
+	}
+
+	// Which IPv6 destinations the tunnel claims. Only dual-stack installs any,
+	// so naming them under a policy that never negotiates IPv6 is a
+	// contradiction the operator cannot discover at runtime — the flag would
+	// simply do nothing — and it is refused here rather than ignored.
+	ipv6Routes, err := tun.ParseIPv6Routes(cfg.TunRoutes6)
+	if err != nil {
+		return tun.VPNConfig{}, err
+	}
+	if ipv6Routes.OperatorManaged() && policy != tun.IPv6PolicyDual {
+		return tun.VPNConfig{}, fmt.Errorf(
+			"-tun-routes6 needs -tun-ipv6=dual: under %q the tunnel never carries IPv6, so there is nothing to route into it",
+			policy)
+	}
+
+	// Parse routes
+	var routes []string
+	if cfg.TunRoutes != "" {
+		routes = append(routes, splitRoutes(cfg.TunRoutes)...)
+	}
+
+	// Handle "auto" TunIP for Android VpnService
+	localIP := net.ParseIP(cfg.TunIP)
+	if localIP == nil && cfg.TunIP == "auto" {
+		localIP = net.ParseIP("10.8.0.2") // Default client IP
+	}
+
+	return tun.VPNConfig{
+		TunName:  cfg.TunName,
+		MTU:      cfg.TunMTU,
+		LocalIP:  localIP,
+		RemoteIP: net.ParseIP(cfg.TunPeerIP),
+		Routes:   routes,
+		// Both transport addresses: the v6 one is what -prefer-ipv6 makes the
+		// strategy manager dial, and a dual-stack tunnel's ::/1 + 8000::/1
+		// half-defaults would otherwise route that socket into the tunnel.
+		ServerAddr:   cfg.ServerAddr,
+		ServerAddrV6: cfg.ServerAddrV6,
+		// Every address the client may dial, so a full tunnel can pin a
+		// bypass route for each. With more than one endpoint the pair above
+		// only covers the first.
+		ServerAddrs: allServerAddrs(cfg),
+		Manager:     mgr,
+		AutoMTU:     cfg.AutoMTU, // active end-to-end MTU probe
+		// Pass the whole policy, not a bool: collapsing it to
+		// "dual or not" silently turns -tun-ipv6 block into off, since block
+		// negotiates nothing and would be indistinguishable from it.
+		IPv6Policy:  policy,
+		IPv6Allow:   ipv6Allow,
+		IPv6Routes:  ipv6Routes,
+		TunFd:       cfg.TunFd,       // Android VpnService TUN fd
+		ProtectPath: cfg.ProtectPath, // Android socket protection path
+	}, nil
+}
+
+func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) error {
+	log.Info("Starting TUN mode")
+	// The VPN client initializes the protector itself from ProtectPath.
+	protect.SetProtocol(cfg.ProtectProto)
+
+	vpnCfg, err := newTUNVPNConfig(cfg, mgr)
+	if err != nil {
+		return err
+	}
+
+	vpnClient, err := tun.NewVPNClient(vpnCfg)
+	if err != nil {
+		return fmt.Errorf("failed to create VPN client: %w", err)
+	}
+
+	// Start VPN
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := vpnClient.Start(ctx); err != nil {
+		cancel()
+		return fmt.Errorf("failed to start VPN: %w", err)
+	}
+
+	// Auto-enable port hopping from server capabilities if not already configured
+	if !mgr.IsPortHoppingEnabled() {
+		caps := vpnClient.GetServerCapabilities()
+		if caps.PortHoppingEnabled && caps.PortRangeStart > 0 && caps.PortRangeEnd > caps.PortRangeStart {
+			// Use server-provided config with defaults
+			hopInterval := time.Duration(caps.HopIntervalSec) * time.Second
+			if hopInterval <= 0 {
+				hopInterval = 60 * time.Second
+			}
+			hopStrategy := porthopping.Strategy(caps.HopStrategy)
+			if hopStrategy == "" {
+				hopStrategy = porthopping.StrategyRandom
+			}
+
+			phCfg := &porthopping.Config{
+				Enabled:        true,
+				PortRangeStart: caps.PortRangeStart,
+				PortRangeEnd:   caps.PortRangeEnd,
+				HopInterval:    hopInterval,
+				Strategy:       hopStrategy,
+				Seed:           caps.HopSeed,
+			}
+			log.Info("Auto-enabling port hopping from server config: range %d-%d, interval %v, strategy %s",
+				caps.PortRangeStart, caps.PortRangeEnd, hopInterval, hopStrategy)
+			if mgr.EnablePortHopping(phCfg) {
+				// Start the port hop checker
+				mgr.StartPortHopChecker(ctx)
+			}
+		}
+	}
+
+	// Start returns only after a successful handshake, so by now the exit has
+	// either assigned an address (and connect moved the TUN device onto it) or
+	// echoed back the requested one. Which of the two gets printed is decided
+	// inside logVPNStarted, where a test can hold it to the assigned one.
+	logVPNStarted(cfg, vpnClient)
+	if len(vpnCfg.Routes) > 0 {
+		log.Info("Routes: %v", vpnCfg.Routes)
+	}
+
+	// Initialize metrics if API addr is configured (TUN mode, no pool yet)
+	if cfg.APIAddr != "" {
+		clientMetrics = NewClientMetrics(mgr, nil)
+		clientMetrics.SetMode(true) // TUN mode
+		go startAPIServer(cfg.APIAddr, clientMetrics)
+
+		// Periodically sync VPN stats to metrics
+		go func() {
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+			var lastPacketsUp, lastPacketsDown, lastBytesUp, lastBytesDown int64
+			var lastConnects, lastReconnectsOK, lastReconnectsFail int64
+			var lastProbeMTU, lastProbeCount int
+			for {
+				select {
+				case <-ticker.C:
+					packetsUp, packetsDown, bytesUp, bytesDown := vpnClient.Stats()
+					// Calculate deltas
+					deltaPacketsUp := packetsUp - lastPacketsUp
+					deltaPacketsDown := packetsDown - lastPacketsDown
+					deltaBytesUp := bytesUp - lastBytesUp
+					deltaBytesDown := bytesDown - lastBytesDown
+					// Update metrics
+					if deltaPacketsUp > 0 || deltaPacketsDown > 0 {
+						clientMetrics.AddPackets(deltaPacketsUp, deltaPacketsDown)
+					}
+					if deltaBytesUp > 0 || deltaBytesDown > 0 {
+						clientMetrics.AddBytes(deltaBytesUp, deltaBytesDown)
+					}
+					// Save last values
+					lastPacketsUp = packetsUp
+					lastPacketsDown = packetsDown
+					lastBytesUp = bytesUp
+					lastBytesDown = bytesDown
+					// Sync lifecycle counters (connections_total / reconnects_total),
+					// which are otherwise never fed in TUN mode.
+					connects, reconnectsOK, reconnectsFail := vpnClient.LifecycleStats()
+					deltaConnects := connects - lastConnects
+					clientMetrics.AddConnectionsTotal(deltaConnects)
+					clientMetrics.AddReconnects(reconnectsOK-lastReconnectsOK, reconnectsFail-lastReconnectsFail)
+					lastConnects = connects
+					lastReconnectsOK = reconnectsOK
+					lastReconnectsFail = reconnectsFail
+					// Surface the auto-MTU probe result once per new outcome.
+					if res, ok := vpnClient.LastMTUProbe(); ok {
+						if res.AppliedMTU != lastProbeMTU || res.Probes != lastProbeCount {
+							clientMetrics.RecordMTUProbe(res.AppliedMTU, res.Probes, res.FallbackReason != "")
+							lastProbeMTU = res.AppliedMTU
+							lastProbeCount = res.Probes
+						}
+					}
+					// Sync current strategy from manager
+					info := mgr.GetLastConnectionInfo()
+					if info.Strategy != "" {
+						clientMetrics.SetCurrentStrategy(info.StrategyID, info.Strategy)
+						// Refresh last-connect timestamp whenever a new tunnel came up.
+						if deltaConnects > 0 {
+							clientMetrics.RecordConnect(info.StrategyID, info.Strategy)
+						}
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	// Also start SOCKS/HTTP proxy if listen addresses are specified
+	var tunnelPool *pool.TunnelPool
+	var listener, httpListener net.Listener
+
+	// The pool is tied to the SOCKS address being configured at all, not to the
+	// listen succeeding — the HTTP listener below shares it.
+	if cfg.ListenAddr != "" {
+		poolCfg := pool.DefaultConfig()
+		tunnelPool = pool.NewTunnelPool(mgr, cfg.ServerAddr, poolCfg)
+	}
+
+	listener, err = startProxy(cfg.ListenAddr, socksProxyLabel)
+	if err != nil {
+		log.Warn("Failed to start SOCKS proxy: %v", err)
+	} else if listener != nil {
+		go acceptConnections(listener, tunnelPool, "socks")
+	}
+
+	if cfg.HTTPListenAddr != "" {
+		httpListener, err = startProxy(cfg.HTTPListenAddr, httpProxyLabel)
+		if err != nil {
+			log.Warn("Failed to start HTTP proxy: %v", err)
+		} else {
+			go acceptConnections(httpListener, tunnelPool, "http")
+		}
+	}
+
+	// Wait for signal
+	sig := <-sigChan
+	log.Info("Received signal %v, shutting down...", sig)
+	cancel()
+	vpnClient.Stop()
+
+	// Cleanup proxy if started
+	if listener != nil {
+		listener.Close()
+	}
+	if httpListener != nil {
+		httpListener.Close()
+	}
+	if tunnelPool != nil {
+		tunnelPool.Close()
+	}
+
+	up, down, bytesUp, bytesDown := vpnClient.Stats()
+	log.Info("Final stats: packets up=%d down=%d, bytes up=%d down=%d", up, down, bytesUp, bytesDown)
+	return nil
+}
+
+func runProxyMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) error {
+	// Create connection pool
+	poolCfg := pool.DefaultConfig()
+	tunnelPool := pool.NewTunnelPool(mgr, cfg.ServerAddr, poolCfg)
+	log.Info("Connection pool initialized (max=%d)", poolCfg.MaxConnections)
+
+	// Initialize metrics if API addr is configured
+	if cfg.APIAddr != "" {
+		clientMetrics = NewClientMetrics(mgr, tunnelPool)
+		clientMetrics.SetMode(false) // proxy mode
+		go startAPIServer(cfg.APIAddr, clientMetrics)
+	}
+
+	// Periodic pool stats logging
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			log.Info("Pool stats: total=%d, max=%d", tunnelPool.Stats(), poolCfg.MaxConnections)
+		}
+	}()
+
+	// Main listener (auto-detect SOCKS5/HTTP)
+	listener, err := startProxy(cfg.ListenAddr, socksProxyLabel)
+	if err != nil {
+		return fmt.Errorf("failed to listen: %w", err)
+	}
+	if listener == nil {
+		// Proxy mode with no proxy port has nothing to do. Refusing beats what
+		// net.Listen does with an empty address, which is to bind a random port
+		// on every interface — an open proxy nobody asked for and nothing in
+		// the log to find it by.
+		return fmt.Errorf("proxy mode needs a listen address: pass -listen, or -tun to run without a local proxy")
+	}
+
+	var httpListener net.Listener
+	if cfg.HTTPListenAddr != "" {
+		httpListener, err = startProxy(cfg.HTTPListenAddr, httpProxyLabel)
+		if err != nil {
+			listener.Close()
+			return fmt.Errorf("failed to listen HTTP: %w", err)
+		}
+	}
+
+	go func() {
+		sig := <-sigChan
+		log.Info("Received signal %v, shutting down...", sig)
+		tunnelPool.Close()
+		listener.Close()
+		if httpListener != nil {
+			httpListener.Close()
+		}
+		os.Exit(0)
+	}()
+
+	var connCounter uint64
+
+	// Start HTTP-only listener if configured
+	if httpListener != nil {
+		go func() {
+			for {
+				conn, err := httpListener.Accept()
+				if err != nil {
+					log.Debug("HTTP Accept error: %v", err)
+					return
+				}
+				// Enable TCP keepalive on client connections
+				if tcpConn, ok := conn.(*net.TCPConn); ok {
+					tcpConn.SetKeepAlive(true)
+					tcpConn.SetKeepAlivePeriod(15 * time.Second)
+				}
+				connID := atomic.AddUint64(&connCounter, 1)
+				go handleHTTPProxyPooled(conn, tunnelPool, connID)
+			}
+		}()
+	}
+
+	// Main listener with auto-detection
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Debug("Accept error: %v", err)
+			continue
+		}
+
+		// Enable TCP keepalive on client connections so browser detects dead connections faster
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(15 * time.Second) // Fast keepalive for browser
+		}
+
+		connID := atomic.AddUint64(&connCounter, 1)
+		go handleConnectionPooled(conn, tunnelPool, connID)
+	}
+}
+
+// acceptConnections accepts connections on a listener and handles them
+func acceptConnections(listener net.Listener, tunnelPool *pool.TunnelPool, mode string) {
+	var connCounter uint64
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Debug("Accept error (%s): %v", mode, err)
+			return
+		}
+		// Enable TCP keepalive
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(15 * time.Second)
+		}
+		connID := atomic.AddUint64(&connCounter, 1)
+		if mode == "http" {
+			go handleHTTPProxyPooled(conn, tunnelPool, connID)
+		} else {
+			go handleConnectionPooled(conn, tunnelPool, connID)
+		}
+	}
+}
+
+// splitRoutes splits comma-separated routes
+func splitRoutes(s string) []string {
+	var routes []string
+	for _, r := range strings.Split(s, ",") {
+		r = strings.TrimSpace(r)
+		if r != "" {
+			routes = append(routes, r)
+		}
+	}
+	return routes
+}
+
+// bufferedConn wraps connection with pre-read buffer
+type bufferedConn struct {
+	net.Conn
+	buffer []byte
+	offset int
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	if c.offset < len(c.buffer) {
+		n := copy(p, c.buffer[c.offset:])
+		c.offset += n
+		return n, nil
+	}
+	return c.Conn.Read(p)
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// ============================================================================
+// POOLED CONNECTION HANDLERS
+// ============================================================================
+
+// targetDialer is the one thing the local proxy handlers need from the tunnel
+// pool. An interface so a test can see the exact target string a request
+// turns into without a server on the other end.
+type targetDialer interface {
+	DialTarget(ctx context.Context, targetAddr string) (*pool.PooledConn, error)
+}
+
+// handleConnectionPooled auto-detects protocol using pooled connections
+func handleConnectionPooled(conn net.Conn, tunnelPool targetDialer, connID uint64) {
+	// Track connection in metrics
+	if clientMetrics != nil {
+		clientMetrics.IncConnections()
+		defer clientMetrics.DecConnections()
+	}
+
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+	// Peek first byte to detect protocol
+	buf := make([]byte, 1)
+	n, err := conn.Read(buf)
+	if err != nil || n < 1 {
+		conn.Close()
+		return
+	}
+
+	// Create buffered connection
+	buffConn := &bufferedConn{
+		Conn:   conn,
+		buffer: buf[:n],
+	}
+
+	if buf[0] == 0x05 {
+		handleSOCKS5Pooled(buffConn, tunnelPool, connID)
+	} else {
+		handleHTTPProxyPooled(buffConn, tunnelPool, connID)
+	}
+}
+
+// handleHTTPProxyPooled handles HTTP proxy with connection pooling
+func handleHTTPProxyPooled(conn net.Conn, tunnelPool targetDialer, connID uint64) {
+	defer conn.Close()
+
+	logger := log.WithPrefix(fmt.Sprintf("http:%d", connID))
+	logger.Debug("New HTTP connection from %s", conn.RemoteAddr())
+
+	// Read HTTP request
+	buf := make([]byte, 4096)
+	totalRead := 0
+
+	for totalRead < len(buf) {
+		conn.SetDeadline(time.Now().Add(10 * time.Second))
+		n, err := conn.Read(buf[totalRead:])
+		if err != nil {
+			logger.Debug("Failed to read HTTP request: %v", err)
+			return
+		}
+		totalRead += n
+		if strings.Contains(string(buf[:totalRead]), "\r\n\r\n") {
+			break
+		}
+	}
+
+	if totalRead < 10 {
+		logger.Debug("HTTP request too short: %d bytes", totalRead)
+		return
+	}
+
+	request := string(buf[:totalRead])
+
+	if !strings.HasPrefix(request, "CONNECT ") {
+		// Plain HTTP - use non-pooled for now (single request)
+		handlePlainHTTPPooled(conn, tunnelPool, request, buf[:totalRead], logger)
+		return
+	}
+
+	// Parse CONNECT request
+	lines := strings.SplitN(request, "\r\n", 2)
+	parts := strings.Split(lines[0], " ")
+	if len(parts) < 2 {
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		return
+	}
+
+	// The port is appended through the shared normaliser: the old
+	// "no colon, add :443" test let "[2001:db8::1]" through without a port,
+	// and a bare IPv6 literal would have been spliced into nonsense.
+	targetAddr, err := endpoint.NormalizeAddr(parts[1], 443)
+	if err != nil || targetAddr == "" {
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		return
+	}
+
+	logger.Info("CONNECT %s", targetAddr)
+
+	// Establish a tunnel to the target. DialTarget sends the target address and
+	// reads the server ack, retrying once on a connection that dies before the
+	// ack (removes the "No response from server: EOF" -> 502 failures).
+	// Allow room for the one retry (two handshakes worst case).
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	serverConn, err := tunnelPool.DialTarget(ctx, targetAddr)
+	if err != nil {
+		logger.Warn("Failed to establish tunnel for %s: %v", targetAddr, err)
+		if clientMetrics != nil {
+			clientMetrics.IncFailed()
+		}
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+
+	// Record successful connection
+	strat := serverConn.Strategy()
+	if clientMetrics != nil {
+		clientMetrics.RecordConnect(strat.ID(), strat.Name())
+	}
+	logger.Debug("Got tunnel connection (strategy=%s)", strat.Name())
+
+	// Send 200 OK
+	conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	conn.SetDeadline(time.Time{})
+
+	// Relay with pooled connection (no confidence penalty for idle)
+	err = pool.PooledRelay(conn, serverConn, 5*time.Minute)
+	if err != nil && err != io.EOF {
+		logger.Debug("Relay ended: %v", err)
+	}
+
+	// Connection is used for specific target, close it (don't reuse)
+	serverConn.Close()
+	logger.Debug("Connection closed (strategy=%s)", serverConn.Strategy().Name())
+}
+
+// handlePlainHTTPPooled handles plain HTTP requests with pooling
+func handlePlainHTTPPooled(conn net.Conn, tunnelPool targetDialer, request string, rawRequest []byte, logger *log.Logger) {
+	lines := strings.SplitN(request, "\r\n", 2)
+	if len(lines) < 1 {
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		return
+	}
+
+	parts := strings.SplitN(lines[0], " ", 3)
+	if len(parts) < 3 {
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		return
+	}
+
+	method := parts[0]
+	rawURL := parts[1]
+	httpVersion := parts[2]
+
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil || parsedURL.Host == "" {
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		return
+	}
+
+	// http://[2001:db8::1]/ has a colon in its host and no port: the old
+	// strings.Contains(":") test sent "[2001:db8::1]" to the tunnel as is.
+	defaultPort := 80
+	if parsedURL.Scheme == "https" {
+		defaultPort = 443
+	}
+	targetHost, err := endpoint.NormalizeAddr(parsedURL.Host, defaultPort)
+	if err != nil {
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		return
+	}
+
+	logger.Info("%s %s", method, parsedURL.Host)
+
+	// Establish a tunnel to the target (retries once on a dead connection).
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	serverConn, err := tunnelPool.DialTarget(ctx, targetHost)
+	if err != nil {
+		logger.Warn("Failed to establish tunnel for %s: %v", targetHost, err)
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+
+	// Rewrite request to relative path
+	path := parsedURL.Path
+	if path == "" {
+		path = "/"
+	}
+	if parsedURL.RawQuery != "" {
+		path += "?" + parsedURL.RawQuery
+	}
+
+	var rewritten strings.Builder
+	rewritten.WriteString(method)
+	rewritten.WriteString(" ")
+	rewritten.WriteString(path)
+	rewritten.WriteString(" ")
+	rewritten.WriteString(httpVersion)
+	rewritten.WriteString("\r\n")
+
+	if len(lines) > 1 {
+		headers := lines[1]
+		hasHost := false
+		for _, line := range strings.Split(headers, "\r\n") {
+			if strings.HasPrefix(strings.ToLower(line), "host:") {
+				hasHost = true
+				break
+			}
+		}
+		if !hasHost {
+			rewritten.WriteString("Host: ")
+			rewritten.WriteString(parsedURL.Host)
+			rewritten.WriteString("\r\n")
+		}
+		rewritten.WriteString(headers)
+	}
+
+	serverConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	serverConn.Write([]byte(rewritten.String()))
+
+	// Relay response
+	serverConn.SetDeadline(time.Time{})
+	conn.SetDeadline(time.Time{})
+	io.Copy(conn, serverConn.Conn)
+
+	serverConn.Close()
+}
+
+// handleSOCKS5Pooled handles SOCKS5 with connection pooling
+func handleSOCKS5Pooled(conn net.Conn, tunnelPool targetDialer, connID uint64) {
+	defer conn.Close()
+
+	logger := log.WithPrefix(fmt.Sprintf("socks:%d", connID))
+	logger.Debug("New connection from %s", conn.RemoteAddr())
+
+	// SOCKS5 handshake
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return
+	}
+
+	if header[0] != 0x05 {
+		return
+	}
+
+	numMethods := int(header[1])
+	if numMethods > 0 {
+		methods := make([]byte, numMethods)
+		if _, err := io.ReadFull(conn, methods); err != nil {
+			return
+		}
+	}
+
+	conn.Write([]byte{0x05, 0x00})
+
+	// Read request
+	reqHeader := make([]byte, 4)
+	if _, err := io.ReadFull(conn, reqHeader); err != nil {
+		return
+	}
+
+	if reqHeader[0] != 0x05 || reqHeader[1] != 0x01 {
+		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+
+	// Parse target address
+	var targetAddr string
+	switch reqHeader[3] {
+	case 0x01: // IPv4
+		addr := make([]byte, 6)
+		if _, err := io.ReadFull(conn, addr); err != nil {
+			return
+		}
+		ip := net.IP(addr[0:4])
+		port := int(addr[4])<<8 | int(addr[5])
+		targetAddr = fmt.Sprintf("%s:%d", ip.String(), port)
+
+	case 0x03: // Domain
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			return
+		}
+		addr := make([]byte, int(lenBuf[0])+2)
+		if _, err := io.ReadFull(conn, addr); err != nil {
+			return
+		}
+		domain := string(addr[:len(addr)-2])
+		port := int(addr[len(addr)-2])<<8 | int(addr[len(addr)-1])
+		// A client may put an IPv6 literal in the domain field; JoinAddr
+		// brackets it where "%s:%d" would not.
+		targetAddr = endpoint.JoinAddr(domain, port)
+
+	case 0x04: // IPv6 - not supported, reject
+		logger.Debug("IPv6 not supported, rejecting")
+		discard := make([]byte, 18)
+		io.ReadFull(conn, discard)
+		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) // Address type not supported
+		return
+
+	default:
+		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+
+	logger.Info("CONNECT %s", targetAddr)
+
+	// Establish a tunnel to the target (retries once on a dead connection).
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	serverConn, err := tunnelPool.DialTarget(ctx, targetAddr)
+	if err != nil {
+		logger.Warn("Failed to establish tunnel for %s: %v", targetAddr, err)
+		if clientMetrics != nil {
+			clientMetrics.IncFailed()
+		}
+		conn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+
+	// Record successful connection
+	strat := serverConn.Strategy()
+	if clientMetrics != nil {
+		clientMetrics.RecordConnect(strat.ID(), strat.Name())
+	}
+	logger.Debug("Got tunnel connection (strategy=%s)", strat.Name())
+
+	// Send SOCKS5 success
+	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	conn.SetDeadline(time.Time{})
+
+	// Relay data (each transport frames the stream itself)
+	err = pool.PooledRelay(conn, serverConn, 5*time.Minute)
+	if err != nil && err != io.EOF {
+		logger.Debug("Relay ended: %v", err)
+	}
+
+	// Connection used for specific target, close (don't reuse)
+	serverConn.Close()
+	logger.Debug("Connection closed (strategy=%s)", serverConn.Strategy().Name())
+}
+
+// startAPIServer starts the metrics HTTP server
+func startAPIServer(addr string, metrics *ClientMetrics) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", metrics.Handler())
+
+	log.Info("Metrics server listening on %s", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Warn("Metrics server error: %v", err)
+	}
+}

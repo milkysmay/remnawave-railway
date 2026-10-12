@@ -1,0 +1,347 @@
+package geneva
+
+import (
+	"encoding/binary"
+	"errors"
+	"strconv"
+)
+
+// Primitive represents a Geneva packet manipulation primitive
+type Primitive interface {
+	// Apply executes the primitive on a TCP packet
+	Apply(packet []byte) ([][]byte, error)
+	// String returns a human-readable description
+	String() string
+}
+
+// DropPrimitive drops a packet (returns empty list)
+type DropPrimitive struct{}
+
+// Apply drops the packet
+func (d *DropPrimitive) Apply(packet []byte) ([][]byte, error) {
+	return nil, nil // Empty list = packet dropped
+}
+
+// String returns description
+func (d *DropPrimitive) String() string {
+	return "drop"
+}
+
+// TamperPrimitive modifies TCP header fields
+type TamperPrimitive struct {
+	Field string // "flags", "seq", "ack", "win", "chksum"
+	Value any    // New value or modification
+}
+
+// NewTamperPrimitive creates a tamper primitive
+func NewTamperPrimitive(field string, value any) *TamperPrimitive {
+	return &TamperPrimitive{
+		Field: field,
+		Value: value,
+	}
+}
+
+// Apply modifies TCP header field
+func (t *TamperPrimitive) Apply(packet []byte) ([][]byte, error) {
+	if len(packet) < 20 {
+		return nil, errors.New("packet too short for IP header")
+	}
+
+	// Parse IP header
+	ipHeaderLen := int((packet[0] & 0x0F) * 4)
+	if len(packet) < ipHeaderLen+20 {
+		return nil, errors.New("packet too short for TCP header")
+	}
+
+	// Create modified copy
+	modified := make([]byte, len(packet))
+	copy(modified, packet)
+
+	tcpStart := ipHeaderLen
+
+	switch t.Field {
+	case "flags":
+		// TCP flags are at offset 13 in TCP header
+		if val, ok := t.Value.(uint8); ok {
+			modified[tcpStart+13] = val
+			recalculateTCPChecksum(modified)
+		}
+	case "seq":
+		// TCP sequence number at offset 4
+		if val, ok := t.Value.(uint32); ok {
+			binary.BigEndian.PutUint32(modified[tcpStart+4:], val)
+			recalculateTCPChecksum(modified)
+		}
+	case "ack":
+		// TCP acknowledgment number at offset 8
+		if val, ok := t.Value.(uint32); ok {
+			binary.BigEndian.PutUint32(modified[tcpStart+8:], val)
+			recalculateTCPChecksum(modified)
+		}
+	case "win":
+		// TCP window size at offset 14
+		if val, ok := t.Value.(uint16); ok {
+			binary.BigEndian.PutUint16(modified[tcpStart+14:], val)
+			recalculateTCPChecksum(modified)
+		}
+	case "chksum":
+		// Explicit checksum override — caller knows what they're doing (desync)
+		if val, ok := t.Value.(uint16); ok {
+			binary.BigEndian.PutUint16(modified[tcpStart+16:], val)
+		}
+	case "ttl":
+		// IP TTL at offset 8
+		if val, ok := t.Value.(uint8); ok {
+			modified[8] = val
+			recalculateIPChecksum(modified)
+		}
+	default:
+		return nil, errors.New("unknown tamper field: " + t.Field)
+	}
+
+	return [][]byte{modified}, nil
+}
+
+// String returns description
+func (t *TamperPrimitive) String() string {
+	return "tamper{" + t.Field + "}"
+}
+
+// FragmentPrimitive splits TCP payload into smaller segments
+type FragmentPrimitive struct {
+	Offset int // Byte offset to fragment at
+	Size   int // Fragment size (if Offset is 0, use Size for equal chunks)
+}
+
+// NewFragmentPrimitive creates a fragment primitive
+func NewFragmentPrimitive(offset, size int) *FragmentPrimitive {
+	return &FragmentPrimitive{
+		Offset: offset,
+		Size:   size,
+	}
+}
+
+// Apply fragments the packet
+func (f *FragmentPrimitive) Apply(packet []byte) ([][]byte, error) {
+	if len(packet) < 20 {
+		return nil, errors.New("packet too short for IP header")
+	}
+
+	ipHeaderLen := int((packet[0] & 0x0F) * 4)
+	if len(packet) < ipHeaderLen+20 {
+		return nil, errors.New("packet too short for TCP header")
+	}
+
+	tcpStart := ipHeaderLen
+	tcpHeaderLen := int((packet[tcpStart+12] >> 4) * 4)
+	payloadStart := tcpStart + tcpHeaderLen
+
+	if len(packet) <= payloadStart {
+		// No payload to fragment
+		return [][]byte{packet}, nil
+	}
+
+	payload := packet[payloadStart:]
+
+	// Determine fragment offset
+	fragmentOffset := f.Offset
+	if fragmentOffset == 0 && f.Size > 0 {
+		fragmentOffset = f.Size
+	}
+
+	if fragmentOffset <= 0 || fragmentOffset >= len(payload) {
+		// Invalid offset, return original
+		return [][]byte{packet}, nil
+	}
+
+	// Create two fragments
+	header := packet[:payloadStart]
+
+	// First fragment: header + payload[:offset]
+	frag1 := make([]byte, len(header)+fragmentOffset)
+	copy(frag1, header)
+	copy(frag1[payloadStart:], payload[:fragmentOffset])
+
+	// Update IP total length and recompute both IP and TCP checksums.
+	binary.BigEndian.PutUint16(frag1[2:4], uint16(len(frag1)))
+	recalculateIPChecksum(frag1)
+	recalculateTCPChecksum(frag1)
+
+	// Second fragment: header + payload[offset:]
+	frag2 := make([]byte, len(header)+len(payload)-fragmentOffset)
+	copy(frag2, header)
+	copy(frag2[payloadStart:], payload[fragmentOffset:])
+
+	// Update sequence number for second fragment
+	seqNum := binary.BigEndian.Uint32(frag2[tcpStart+4:])
+	seqNum += uint32(fragmentOffset)
+	binary.BigEndian.PutUint32(frag2[tcpStart+4:], seqNum)
+
+	// Update IP total length and recompute both checksums.
+	binary.BigEndian.PutUint16(frag2[2:4], uint16(len(frag2)))
+	recalculateIPChecksum(frag2)
+	recalculateTCPChecksum(frag2)
+
+	return [][]byte{frag1, frag2}, nil
+}
+
+// String returns description
+func (f *FragmentPrimitive) String() string {
+	if f.Offset > 0 {
+		return "fragment{offset=" + strconv.Itoa(f.Offset) + "}"
+	}
+	return "fragment{size=" + strconv.Itoa(f.Size) + "}"
+}
+
+// DuplicatePrimitive sends a duplicate packet
+type DuplicatePrimitive struct {
+	Count int // Number of duplicates (default 1)
+}
+
+// NewDuplicatePrimitive creates a duplicate primitive
+func NewDuplicatePrimitive(count int) *DuplicatePrimitive {
+	if count < 1 {
+		count = 1
+	}
+	return &DuplicatePrimitive{
+		Count: count,
+	}
+}
+
+// Apply duplicates the packet
+func (d *DuplicatePrimitive) Apply(packet []byte) ([][]byte, error) {
+	result := make([][]byte, d.Count+1)
+
+	// Original packet
+	result[0] = packet
+
+	// Duplicates
+	for i := 0; i < d.Count; i++ {
+		dup := make([]byte, len(packet))
+		copy(dup, packet)
+		result[i+1] = dup
+	}
+
+	return result, nil
+}
+
+// String returns description
+func (d *DuplicatePrimitive) String() string {
+	if d.Count == 1 {
+		return "duplicate"
+	}
+	return "duplicate{count=" + strconv.Itoa(d.Count) + "}"
+}
+
+// SendPrimitive sends a packet as-is (no-op)
+type SendPrimitive struct{}
+
+// Apply returns the packet unmodified
+func (s *SendPrimitive) Apply(packet []byte) ([][]byte, error) {
+	return [][]byte{packet}, nil
+}
+
+// String returns description
+func (s *SendPrimitive) String() string {
+	return "send"
+}
+
+// recalculateIPChecksum recalculates IP header checksum
+func recalculateIPChecksum(packet []byte) {
+	if len(packet) < 20 {
+		return
+	}
+
+	// Zero out existing checksum
+	packet[10] = 0
+	packet[11] = 0
+
+	ipHeaderLen := int((packet[0] & 0x0F) * 4)
+	if ipHeaderLen > len(packet) {
+		return
+	}
+
+	// Calculate checksum
+	var sum uint32
+	for i := 0; i < ipHeaderLen; i += 2 {
+		sum += uint32(packet[i])<<8 | uint32(packet[i+1])
+	}
+
+	// Add carry
+	for sum > 0xFFFF {
+		sum = (sum & 0xFFFF) + (sum >> 16)
+	}
+
+	// One's complement
+	checksum := uint16(^sum)
+
+	packet[10] = byte(checksum >> 8)
+	packet[11] = byte(checksum)
+}
+
+// recalculateTCPChecksum recalculates the TCP checksum over the IPv4 pseudo-header.
+// Must be called after any TCP header field modification (flags, seq, ack, win).
+func recalculateTCPChecksum(packet []byte) {
+	if len(packet) < 20 {
+		return
+	}
+	ipHeaderLen := int((packet[0] & 0x0F) * 4)
+	if ipHeaderLen+20 > len(packet) {
+		return
+	}
+	tcpStart := ipHeaderLen
+	tcpLen := len(packet) - tcpStart
+
+	// Zero out TCP checksum field
+	packet[tcpStart+16] = 0
+	packet[tcpStart+17] = 0
+
+	// Pseudo-header: src IP(4) + dst IP(4) + zero(1) + proto(1) + tcp length(2)
+	var sum uint32
+	for i := 12; i < 20; i += 2 {
+		sum += uint32(packet[i])<<8 | uint32(packet[i+1])
+	}
+	sum += uint32(6) // TCP protocol number
+	sum += uint32(tcpLen)
+
+	// TCP header + data
+	for i := tcpStart; i+1 < len(packet); i += 2 {
+		sum += uint32(packet[i])<<8 | uint32(packet[i+1])
+	}
+	if len(packet)%2 != 0 {
+		sum += uint32(packet[len(packet)-1]) << 8
+	}
+
+	for sum > 0xFFFF {
+		sum = (sum & 0xFFFF) + (sum >> 16)
+	}
+	checksum := uint16(^sum)
+	packet[tcpStart+16] = byte(checksum >> 8)
+	packet[tcpStart+17] = byte(checksum)
+}
+
+// TCPFlags represents TCP header flags
+const (
+	TCPFlagFIN = 0x01
+	TCPFlagSYN = 0x02
+	TCPFlagRST = 0x04
+	TCPFlagPSH = 0x08
+	TCPFlagACK = 0x10
+	TCPFlagURG = 0x20
+	TCPFlagECE = 0x40
+	TCPFlagCWR = 0x80
+)
+
+// ParseTCPFlags parses TCP flags from packet
+func ParseTCPFlags(packet []byte) (uint8, error) {
+	if len(packet) < 20 {
+		return 0, errors.New("packet too short for IP header")
+	}
+
+	ipHeaderLen := int((packet[0] & 0x0F) * 4)
+	if len(packet) < ipHeaderLen+20 {
+		return 0, errors.New("packet too short for TCP header")
+	}
+
+	return packet[ipHeaderLen+13], nil
+}

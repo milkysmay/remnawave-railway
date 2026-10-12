@@ -1,0 +1,557 @@
+package strategy
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	mathrand "math/rand/v2"
+	"net"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/tiredvpn/tiredvpn/internal/ktls"
+	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/padding"
+	"github.com/tiredvpn/tiredvpn/internal/protocol"
+)
+
+// browserUserAgent is a plausible desktop-browser User-Agent for the WebSocket
+// upgrade. The point is to name a real browser, not the product: the old
+// "TiredVPN/2.0" was a self-report a header scan could match on directly.
+const browserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+// maxWSFrameLen caps a payload length announced in a WebSocket frame header.
+// Tunnel frames are one relay buffer (tens of KB); 1 MiB leaves headroom while
+// keeping a hostile peer from naming a length we would allocate. Without it the
+// 64-bit extended length turns into an OOM (or, once it exceeds 2^63, a
+// negative int and a make() panic).
+const maxWSFrameLen = 1 << 20
+
+// WebSocketPaddedStrategy implements WebSocket transport with Salamander padding
+// Priority 8 (high, between HTTP/2 Stego and Traffic Morph)
+type WebSocketPaddedStrategy struct {
+	manager *Manager // IPv6/IPv4 transport layer support
+	secret  []byte
+	wsPath  string
+	wsHost  string
+}
+
+// NewWebSocketPaddedStrategy creates a new WebSocket Padded strategy
+// manager is required for IPv6/IPv4 transport layer support
+func NewWebSocketPaddedStrategy(manager *Manager, secret []byte) *WebSocketPaddedStrategy {
+	return &WebSocketPaddedStrategy{
+		manager: manager,
+		secret:  secret,
+		wsPath:  "/ws",
+		wsHost:  "chat.openai.com", // Mimic ChatGPT WebSocket
+	}
+}
+
+// Name returns human-readable strategy name
+func (s *WebSocketPaddedStrategy) Name() string {
+	return "WebSocket Salamander"
+}
+
+// ID returns strategy identifier
+func (s *WebSocketPaddedStrategy) ID() string {
+	return "websocket_padded"
+}
+
+// Priority returns strategy priority
+func (s *WebSocketPaddedStrategy) Priority() int {
+	return 8
+}
+
+// RequiresServer indicates this strategy needs a server
+func (s *WebSocketPaddedStrategy) RequiresServer() bool {
+	return true
+}
+
+// SupportsUDP returns whether this strategy supports UDP traffic
+func (s *WebSocketPaddedStrategy) SupportsUDP() bool {
+	return false
+}
+
+// Description returns a human-readable description
+func (s *WebSocketPaddedStrategy) Description() string {
+	return "WebSocket with Salamander padding - high obfuscation transport"
+}
+
+// Probe tests if WebSocket Padded strategy is likely to work
+func (s *WebSocketPaddedStrategy) Probe(ctx context.Context, target string) error {
+	// Shallow reachability check: a plain TCP connect against the same address
+	// Connect uses (no TLS, no WebSocket upgrade). A full handshake here,
+	// multiplied across ProbeAll's parallel strategies and periodic reprobes,
+	// would trip server admission control.
+	serverAddr := s.manager.GetServerAddr(ctx)
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", serverAddr)
+	if err != nil {
+		return err
+	}
+	conn.Close()
+	return nil
+}
+
+// Connect establishes a WebSocket Padded connection
+func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
+	// Get server address (IPv6/IPv4 with automatic fallback)
+	serverAddr := s.manager.GetServerAddr(ctx)
+	secret := dialSecret(ctx, s.secret)
+	log.Debug("WebSocket Padded: Connecting to %s via %s", target, serverAddr)
+
+	// 1. Establish TLS connection to server (context-aware)
+	dialer := &net.Dialer{
+		KeepAlive: 30 * time.Second,
+	}
+
+	tlsConfig := &tls.Config{
+		ServerName:         s.wsHost,
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS12,
+		NextProtos:         []string{"h2", "http/1.1"},
+		ClientSessionCache: s.manager.TLSSessionCache(), // resume across reconnects
+	}
+
+	tcpConn, err := dialer.DialContext(ctx, "tcp", serverAddr)
+	if err != nil {
+		return nil, fmt.Errorf("websocket_padded: tcp dial failed: %w", err)
+	}
+
+	tlsConn := tls.Client(tcpConn, tlsConfig)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("websocket_padded: tls handshake failed: %w", err)
+	}
+
+	// Send protocol discriminator (encrypted, not visible to DPI)
+	if err := protocol.WriteDispatch(tlsConn, protocol.TypeWS); err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("websocket_padded: dispatch failed: %w", err)
+	}
+
+	// Set optimizations
+	if tc, ok := tlsConn.NetConn().(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	// 2. Send WebSocket upgrade request with auth token bound to this TLS session
+	// (S22): a token captured on another session fails on the server, which
+	// derives the same exporter from its own side of this handshake.
+	ekm, err := sessionExporterKey(tlsConn)
+	if err != nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("websocket_padded: export keying material: %w", err)
+	}
+	wsKey := generateWebSocketKey()
+	authToken := generateAuthTokenBound(secret, ekm)
+	upgradeReq := fmt.Sprintf(
+		"GET %s HTTP/1.1\r\n"+
+			"Host: %s\r\n"+
+			"Upgrade: websocket\r\n"+
+			"Connection: Upgrade\r\n"+
+			"Sec-WebSocket-Key: %s\r\n"+
+			"Sec-WebSocket-Version: 13\r\n"+
+			"X-Auth-Token: %s\r\n"+
+			"User-Agent: "+browserUserAgent+"\r\n"+
+			"\r\n",
+		s.wsPath, s.wsHost, wsKey, hex.EncodeToString(authToken))
+
+	if _, err := tlsConn.Write([]byte(upgradeReq)); err != nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("websocket_padded: upgrade request failed: %w", err)
+	}
+
+	log.Debug("WebSocket Padded: Sent upgrade request")
+
+	// 3. Read upgrade response — byte-exact, no over-read past \r\n\r\n,
+	// so the subsequent ktls.TryEnable can take a clean socket.
+	if deadline, ok := ctx.Deadline(); ok {
+		tlsConn.SetReadDeadline(deadline)
+	} else {
+		tlsConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	}
+
+	statusLine, _, err := readWSUpgradeResponseExact(tlsConn, 8192)
+	if err != nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("websocket_padded: failed to read upgrade response: %w", err)
+	}
+	tlsConn.SetReadDeadline(time.Time{})
+
+	if !strings.Contains(statusLine, "101") {
+		tlsConn.Close()
+		return nil, fmt.Errorf("websocket_padded: upgrade failed: %s", statusLine)
+	}
+
+	// Auth + upgrade complete: kernel offload for the WebSocket-frame phase.
+	// On non-Linux / no-kTLS platforms this is a no-op (returns tlsConn).
+	var baseConn net.Conn = tlsConn
+	if k := ktls.TryEnable(tlsConn, "websocket-padded"); k != nil {
+		baseConn = k
+	}
+
+	log.Info("WebSocket Padded: Upgrade successful")
+
+	// 4. Determine padding level adaptively
+	// For now, use Balanced - in production, get from Strategy Manager confidence
+	paddingLevel := padding.Balanced
+
+	// 5. Wrap with SalamanderConn
+	padder := padding.NewSalamanderPadder(secret, paddingLevel)
+	salamanderConn := NewSalamanderConn(baseConn, padder, true) // true = client side
+
+	log.Info("WebSocket Padded: Connection established to %s", target)
+
+	return salamanderConn, nil
+}
+
+// readWSUpgradeResponseExact reads HTTP/1.1 status line + headers from conn
+// strictly up to and including \r\n\r\n, byte-by-byte, with no over-read.
+// A subsequent conn.Read() (potentially through ktls.Conn) will start on
+// the first byte of the WebSocket frame stream.
+//
+// Mirrors internal/server/http_request_reader.go:readHTTPRequestExact.
+// The duplication is intentional — moving both into a shared package is
+// a future cleanup.
+func readWSUpgradeResponseExact(conn net.Conn, maxHeaderBytes int) (string, map[string]string, error) {
+	if maxHeaderBytes <= 0 {
+		maxHeaderBytes = 8192
+	}
+	buf := make([]byte, 0, 1024)
+	one := make([]byte, 1)
+	for len(buf) < maxHeaderBytes {
+		if _, err := io.ReadFull(conn, one); err != nil {
+			return "", nil, fmt.Errorf("read response byte: %w", err)
+		}
+		buf = append(buf, one[0])
+		n := len(buf)
+		if n >= 4 &&
+			buf[n-4] == '\r' && buf[n-3] == '\n' &&
+			buf[n-2] == '\r' && buf[n-1] == '\n' {
+			lines := strings.Split(string(buf[:n-4]), "\r\n")
+			if len(lines) == 0 {
+				return "", nil, errors.New("empty response")
+			}
+			statusLine := lines[0]
+			headers := make(map[string]string, len(lines)-1)
+			for _, line := range lines[1:] {
+				if line == "" {
+					continue
+				}
+				i := strings.IndexByte(line, ':')
+				if i <= 0 {
+					return "", nil, fmt.Errorf("malformed header: %q", line)
+				}
+				headers[strings.TrimSpace(line[:i])] = strings.TrimSpace(line[i+1:])
+			}
+			return statusLine, headers, nil
+		}
+	}
+	return "", nil, errors.New("response too large")
+}
+
+// SalamanderConn wraps a WebSocket connection with Salamander padding
+type SalamanderConn struct {
+	conn     net.Conn
+	padder   *padding.SalamanderPadder
+	isClient bool
+
+	readBuf []byte
+	readMu  sync.Mutex
+	writeMu sync.Mutex
+	closeMu sync.Mutex
+	closed  bool
+}
+
+// NewSalamanderConn creates a new Salamander-wrapped connection
+func NewSalamanderConn(conn net.Conn, padder *padding.SalamanderPadder, isClient bool) *SalamanderConn {
+	return &SalamanderConn{
+		conn:     conn,
+		padder:   padder,
+		isClient: isClient,
+		readBuf:  make([]byte, 0, 64*1024),
+	}
+}
+
+// Read implements net.Conn Read
+func (sc *SalamanderConn) Read(p []byte) (int, error) {
+	sc.readMu.Lock()
+	defer sc.readMu.Unlock()
+
+	// Return buffered data first
+	if len(sc.readBuf) > 0 {
+		n := copy(p, sc.readBuf)
+		sc.readBuf = sc.readBuf[n:]
+		return n, nil
+	}
+
+	// Read WebSocket frame
+	frame, err := sc.readWebSocketFrame()
+	if err != nil {
+		return 0, err
+	}
+
+	// Decrypt with Salamander
+	decrypted, err := sc.padder.Decrypt(frame)
+	if err != nil {
+		return 0, fmt.Errorf("salamander decrypt failed: %w", err)
+	}
+
+	// WebSocket frames have 2-byte length prefix for actual data length
+	if len(decrypted) < 2 {
+		return 0, errors.New("salamander: decrypted data too short")
+	}
+
+	dataLen := int(binary.BigEndian.Uint16(decrypted[0:2]))
+	if dataLen > len(decrypted)-2 {
+		return 0, errors.New("salamander: invalid data length")
+	}
+
+	actualData := decrypted[2 : 2+dataLen]
+
+	// Copy to output buffer
+	n := copy(p, actualData)
+
+	// Buffer remainder if any
+	if n < len(actualData) {
+		sc.readBuf = append(sc.readBuf, actualData[n:]...)
+	}
+
+	return n, nil
+}
+
+// Write implements net.Conn Write
+func (sc *SalamanderConn) Write(p []byte) (int, error) {
+	sc.writeMu.Lock()
+	defer sc.writeMu.Unlock()
+
+	if sc.closed {
+		return 0, errors.New("connection closed")
+	}
+
+	if len(p) > 65535 {
+		return 0, fmt.Errorf("salamander: payload too large (%d > 65535)", len(p))
+	}
+
+	// Prepend 2-byte length prefix
+	dataWithLen := make([]byte, 2+len(p))
+	binary.BigEndian.PutUint16(dataWithLen[0:2], uint16(len(p)))
+	copy(dataWithLen[2:], p)
+
+	// Encrypt with Salamander (adds salt + padding)
+	encrypted, err := sc.padder.Encrypt(dataWithLen)
+	if err != nil {
+		return 0, fmt.Errorf("salamander encrypt failed: %w", err)
+	}
+
+	// Build WebSocket binary frame
+	frame := sc.buildWebSocketFrame(encrypted)
+
+	// Write to underlying connection
+	if _, err := sc.conn.Write(frame); err != nil {
+		return 0, err
+	}
+
+	return len(p), nil
+}
+
+// readWebSocketFrame reads a complete WebSocket frame
+func (sc *SalamanderConn) readWebSocketFrame() ([]byte, error) {
+	// Read 2-byte header
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(sc.conn, header); err != nil {
+		return nil, err
+	}
+
+	fin := (header[0] & 0x80) != 0
+	opcode := header[0] & 0x0F
+	masked := (header[1] & 0x80) != 0
+	payloadLen := int(header[1] & 0x7F)
+
+	// Check for binary frame
+	if opcode != 0x02 && opcode != 0x00 { // Binary or continuation
+		if opcode == 0x08 { // Close frame
+			return nil, io.EOF
+		}
+		return nil, fmt.Errorf("unexpected websocket opcode: 0x%02X", opcode)
+	}
+
+	// Extended payload length
+	switch payloadLen {
+	case 126:
+		extLen := make([]byte, 2)
+		if _, err := io.ReadFull(sc.conn, extLen); err != nil {
+			return nil, err
+		}
+		payloadLen = int(binary.BigEndian.Uint16(extLen))
+	case 127:
+		extLen := make([]byte, 8)
+		if _, err := io.ReadFull(sc.conn, extLen); err != nil {
+			return nil, err
+		}
+		payloadLen = int(binary.BigEndian.Uint64(extLen))
+	}
+
+	// Cap the peer-announced length before allocating. A 64-bit length past
+	// 2^63 wraps to a negative int (make panics); anything huge is an OOM.
+	if payloadLen < 0 || payloadLen > maxWSFrameLen {
+		return nil, fmt.Errorf("websocket frame length %d exceeds the %d byte cap", payloadLen, maxWSFrameLen)
+	}
+
+	// Read masking key if present (server → client has no mask)
+	var maskKey [4]byte
+	if masked {
+		if _, err := io.ReadFull(sc.conn, maskKey[:]); err != nil {
+			return nil, err
+		}
+	}
+
+	// Read payload
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(sc.conn, payload); err != nil {
+		return nil, err
+	}
+
+	// Unmask if masked
+	if masked {
+		for i := range payload {
+			payload[i] ^= maskKey[i%4]
+		}
+	}
+
+	if !fin {
+		return nil, errors.New("fragmented frames not supported")
+	}
+
+	return payload, nil
+}
+
+// buildWebSocketFrame constructs a WebSocket binary frame (RFC 6455).
+// Single known-size allocation, 4-byte unrolled XOR masking.
+func (sc *SalamanderConn) buildWebSocketFrame(payload []byte) []byte {
+	payloadLen := len(payload)
+
+	// Header size: byte0 + byte1 (+ extended length) (+ 4-byte mask key).
+	headerLen := 2
+	switch {
+	case payloadLen < 126:
+		// no extended length
+	case payloadLen < 65536:
+		headerLen += 2
+	default:
+		headerLen += 8
+	}
+
+	maskBit := byte(0x00)
+	if sc.isClient {
+		maskBit = 0x80 // Client must mask
+		headerLen += 4 // 4-byte masking key
+	}
+
+	frame := make([]byte, headerLen+payloadLen)
+
+	// Byte 0: FIN + RSV + OPCODE (0x82 = FIN + Binary)
+	frame[0] = 0x82
+
+	// Byte 1 (+ extended length): MASK + payload length
+	pos := 2
+	switch {
+	case payloadLen < 126:
+		frame[1] = maskBit | byte(payloadLen)
+	case payloadLen < 65536:
+		frame[1] = maskBit | 126
+		binary.BigEndian.PutUint16(frame[2:4], uint16(payloadLen))
+		pos = 4
+	default:
+		frame[1] = maskBit | 127
+		binary.BigEndian.PutUint64(frame[2:10], uint64(payloadLen))
+		pos = 10
+	}
+
+	if !sc.isClient {
+		// Server doesn't mask: header followed by raw payload.
+		copy(frame[pos:], payload)
+		return frame
+	}
+
+	// Masking key. WS masking exists only to confuse middleboxes, not for
+	// cryptographic strength, so a fast non-crypto RNG is sufficient here.
+	var maskKey [4]byte
+	binary.LittleEndian.PutUint32(maskKey[:], mathrand.Uint32())
+	copy(frame[pos:pos+4], maskKey[:])
+	out := frame[pos+4:]
+
+	// XOR-mask payload, unrolled by 4 bytes.
+	i := 0
+	for ; i+4 <= payloadLen; i += 4 {
+		out[i] = payload[i] ^ maskKey[0]
+		out[i+1] = payload[i+1] ^ maskKey[1]
+		out[i+2] = payload[i+2] ^ maskKey[2]
+		out[i+3] = payload[i+3] ^ maskKey[3]
+	}
+	for ; i < payloadLen; i++ {
+		out[i] = payload[i] ^ maskKey[i&3]
+	}
+
+	return frame
+}
+
+// Close closes the connection
+func (sc *SalamanderConn) Close() error {
+	sc.closeMu.Lock()
+	defer sc.closeMu.Unlock()
+
+	if sc.closed {
+		return nil
+	}
+
+	sc.closed = true
+
+	// Send WebSocket close frame
+	closeFrame := []byte{0x88, 0x00} // FIN + Close opcode, 0 length
+	sc.conn.Write(closeFrame)
+
+	return sc.conn.Close()
+}
+
+// LocalAddr returns local address
+func (sc *SalamanderConn) LocalAddr() net.Addr {
+	return sc.conn.LocalAddr()
+}
+
+// RemoteAddr returns remote address
+func (sc *SalamanderConn) RemoteAddr() net.Addr {
+	return sc.conn.RemoteAddr()
+}
+
+// SetDeadline sets read/write deadline
+func (sc *SalamanderConn) SetDeadline(t time.Time) error {
+	return sc.conn.SetDeadline(t)
+}
+
+// SetReadDeadline sets read deadline
+func (sc *SalamanderConn) SetReadDeadline(t time.Time) error {
+	return sc.conn.SetReadDeadline(t)
+}
+
+// SetWriteDeadline sets write deadline
+func (sc *SalamanderConn) SetWriteDeadline(t time.Time) error {
+	return sc.conn.SetWriteDeadline(t)
+}
+
+// generateWebSocketKey generates a random Sec-WebSocket-Key
+func generateWebSocketKey() string {
+	key := make([]byte, 16)
+	rand.Read(key)
+	return base64.StdEncoding.EncodeToString(key)
+}

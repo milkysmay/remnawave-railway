@@ -1,0 +1,5793 @@
+package server
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	mrand "math/rand/v2"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+	"github.com/tiredvpn/tiredvpn/internal/capabilities"
+	"github.com/tiredvpn/tiredvpn/internal/control"
+	"github.com/tiredvpn/tiredvpn/internal/ktls"
+	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/padding"
+	"github.com/tiredvpn/tiredvpn/internal/protocol"
+	"github.com/tiredvpn/tiredvpn/internal/shaper"
+	"github.com/tiredvpn/tiredvpn/internal/shaper/presets"
+	"github.com/tiredvpn/tiredvpn/internal/strategy"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
+	"github.com/tiredvpn/tiredvpn/internal/tun"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
+)
+
+var (
+	Version     = "1.11.5"
+	connCounter uint64
+)
+
+const (
+	// defaultMaxConcurrentConns is the admission-control limit applied when
+	// Config.MaxConcurrentConns is unset. Chosen to comfortably serve a real
+	// client population while capping memory under a probe storm: each in-flight
+	// connection can hold a peek-buffer (up to 16KB) plus relay buffers.
+	defaultMaxConcurrentConns = 4096
+
+	// defaultRelayMaxConcurrentConns is the admission-control limit applied to a
+	// relay node (-upstream set) when Config.MaxConcurrentConns is unset. A relay
+	// holds a full upstream stego/TLS bridge per client (socket buffers + framer
+	// + goroutines), so it is far heavier per connection than an exit node and a
+	// 3GB box cannot survive the 4096 exit default. 256 keeps the worst-case
+	// memory ceiling bounded while still serving a real client population.
+	defaultRelayMaxConcurrentConns = 256
+
+	// defaultRelayIdleTimeout is the idle deadline for a relay->upstream TUN
+	// bridge when Config.RelayIdleTimeout is unset. If no bytes flow in either
+	// direction for this long the bridge is force-closed to reap half-open
+	// downstreams (lost RU->node A link) that would otherwise pin an admission slot,
+	// an 8MB-buffered upstream conn and goroutines forever. A healthy TUN client
+	// sends a keepalive frame every 10s (internal/tun keepaliveInterval), so 90s
+	// never trips a live session.
+	defaultRelayIdleTimeout = 90 * time.Second
+
+	// probeReadDeadline is the initial read deadline for un-classified inbound
+	// connections. Kept short so probe-storm goroutines (and their peek-buffers)
+	// are released quickly instead of lingering for the legitimate-handshake
+	// timeout. 5s is ample for a real ClientHello, including fragmented REALITY.
+	probeReadDeadline = 5 * time.Second
+)
+
+// admissionSem is a buffered-channel semaphore bounding concurrent in-flight
+// incoming TCP connections across all accept-loops. Initialised once by
+// initAdmissionControl before listeners start accepting.
+var admissionSem chan struct{}
+
+// initAdmissionControl sizes the global admission semaphore from cfg. Safe to
+// call once at startup before any accept-loop runs.
+func initAdmissionControl(cfg *Config) {
+	limit := cfg.MaxConcurrentConns
+	if limit <= 0 {
+		// A relay (-upstream) holds a heavy per-client upstream bridge, so it gets
+		// a much smaller default than an exit node. An explicit -max-conns always
+		// wins for both roles.
+		if cfg.UpstreamAddr != "" {
+			limit = defaultRelayMaxConcurrentConns
+		} else {
+			limit = defaultMaxConcurrentConns
+		}
+	}
+	admissionSem = make(chan struct{}, limit)
+	log.Info("Admission control: max %d concurrent incoming connections", limit)
+}
+
+// onHandlerDone, when non-nil, is invoked after a spawned handler goroutine
+// fully exits and releases its admission slot. Production leaves it nil; tests
+// set it to observe goroutine completion deterministically (no shared-var
+// polling), which keeps `go test -race` clean.
+var onHandlerDone func()
+
+// acceptConnection applies admission control: it tries to reserve a slot and,
+// on success, spawns handleConnection in a goroutine that releases the slot on
+// exit. When the limit is reached the new connection is dropped (closed)
+// immediately rather than queued, so a reconnect storm cannot accumulate
+// goroutines or buffers. Returns true if the connection was admitted.
+func acceptConnection(conn net.Conn, srvCtx *serverContext, connID uint64) bool {
+	// Capture the semaphore into a local so the spawned goroutine releases the
+	// exact channel it acquired and never reads the package-level admissionSem
+	// variable concurrently with any reassignment.
+	sem := admissionSem
+
+	// Defensive: if admission control was not initialised, fall back to the old
+	// unbounded behaviour rather than dropping every connection.
+	if sem == nil {
+		go handleConnection(conn, srvCtx, connID)
+		return true
+	}
+	select {
+	case sem <- struct{}{}:
+		go func() {
+			defer func() {
+				<-sem
+				if onHandlerDone != nil {
+					onHandlerDone()
+				}
+			}()
+			handleConnection(conn, srvCtx, connID)
+		}()
+		return true
+	default:
+		log.Warn("Admission control: dropping connection %d from %s (limit %d reached)",
+			connID, conn.RemoteAddr(), cap(sem))
+		conn.Close()
+		return false
+	}
+}
+
+// checkUDPBufferSizes checks if system UDP buffer sizes are adequate for QUIC
+// Returns true if buffers are properly configured
+func checkUDPBufferSizes() bool {
+	const minBuffer = 7500000 // 7.5MB recommended for QUIC
+
+	rmemMax, err := os.ReadFile("/proc/sys/net/core/rmem_max")
+	if err != nil {
+		log.Warn("Cannot read rmem_max: %v", err)
+		return false
+	}
+
+	wmemMax, err := os.ReadFile("/proc/sys/net/core/wmem_max")
+	if err != nil {
+		log.Warn("Cannot read wmem_max: %v", err)
+		return false
+	}
+
+	var rmem, wmem int
+	fmt.Sscanf(string(bytes.TrimSpace(rmemMax)), "%d", &rmem)
+	fmt.Sscanf(string(bytes.TrimSpace(wmemMax)), "%d", &wmem)
+
+	if rmem < minBuffer || wmem < minBuffer {
+		log.Warn("UDP buffer sizes too small for optimal QUIC performance!")
+		log.Warn("  Current: rmem_max=%d, wmem_max=%d", rmem, wmem)
+		log.Warn("  Recommended: %d (7.5MB)", minBuffer)
+		log.Warn("  Fix with: sysctl -w net.core.rmem_max=%d net.core.wmem_max=%d", minBuffer, minBuffer)
+		log.Warn("  Persist: add to /etc/sysctl.conf")
+		return false
+	}
+
+	log.Debug("UDP buffer sizes OK: rmem_max=%d, wmem_max=%d", rmem, wmem)
+	return true
+}
+
+// setTCPOptions applies performance optimizations to TCP connections
+func setTCPOptions(conn net.Conn) {
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)   // Disable Nagle's algorithm for low latency
+		tc.SetKeepAlive(true) // Enable TCP keepalive
+		tc.SetKeepAlivePeriod(30 * time.Second)
+		tc.SetReadBuffer(4 * 1024 * 1024)  // 4MB read buffer (BDP at high RTT)
+		tc.SetWriteBuffer(4 * 1024 * 1024) // 4MB write buffer (BDP at high RTT)
+	}
+}
+
+// optimizedDial dials with TCP optimizations applied
+func optimizedDial(network, addr string, timeout time.Duration) (net.Conn, error) {
+	conn, err := net.DialTimeout(network, addr, timeout)
+	if err != nil {
+		return nil, err
+	}
+	setTCPOptions(conn)
+	return conn, nil
+}
+
+// optimizedRelay copies between connections using larger buffers
+func optimizedRelay(dst, src net.Conn) (int64, error) {
+	buf := GetRelayBuffer()
+	defer PutRelayBuffer(buf)
+	return io.CopyBuffer(dst, src, buf)
+}
+
+// isTimeout checks if error is a timeout error
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
+	}
+	return false
+}
+
+// relayWithControl relays data while handling control messages
+// clientConn is the VPN client, targetConn is the destination server
+// Control messages from client are handled and responded to, not forwarded
+func relayWithControl(clientConn, targetConn net.Conn) (bytesUp, bytesDown int64) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	var up, down int64
+
+	// Client -> Target (with control message filtering)
+	go func() {
+		defer wg.Done()
+		buf := GetRelayBuffer()
+		defer PutRelayBuffer(buf)
+
+		for {
+			n, err := clientConn.Read(buf)
+			if n > 0 {
+				// Check for control message
+				if control.IsControlMessage(buf[:n]) {
+					// Handle control message and respond
+					control.HandleServerMessage(clientConn, buf[:n])
+					continue // Don't forward to target
+				}
+				// Forward to target
+				written, werr := targetConn.Write(buf[:n])
+				atomic.AddInt64(&up, int64(written))
+				if werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Target -> Client (pass through)
+	go func() {
+		defer wg.Done()
+		buf := GetRelayBuffer()
+		defer PutRelayBuffer(buf)
+
+		for {
+			n, err := targetConn.Read(buf)
+			if n > 0 {
+				written, werr := clientConn.Write(buf[:n])
+				atomic.AddInt64(&down, int64(written))
+				if werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	bytesUp = atomic.LoadInt64(&up)
+	bytesDown = atomic.LoadInt64(&down)
+	return
+}
+
+// Config holds server configuration
+type Config struct {
+	ListenAddr  string
+	CertFile    string
+	KeyFile     string
+	Secret      []byte // Single secret mode (backward compatible)
+	FakeWebRoot string
+	Debug       bool
+	TunIP       net.IP
+	TunName     string // TUN interface name (default: tiredvpn0)
+	TunMTU      int    // TUN interface MTU (0 = tun.DefaultMTU = 1280)
+
+	// Multi-client mode (Redis)
+	RedisAddr string // e.g., "localhost:6379"
+	// RedisDB is the logical Redis database (0..15). Together with RedisPrefix
+	// it isolates instances that share one Redis: on node A the mux, relay-b and
+	// relay-c all point at 127.0.0.1:6379 and would otherwise share one
+	// client registry and one IP pool namespace.
+	RedisDB int
+	// RedisPrefix is the key namespace. Empty = DefaultRedisPrefix.
+	RedisPrefix string
+	APIAddr     string // e.g., "127.0.0.1:8080"
+	APIToken    string // optional bearer token for the management API ("" = no auth)
+
+	// Upstream (multi-hop) mode
+	UpstreamAddr   string // e.g., "exit-server.com:443"
+	UpstreamSecret string // secret for upstream auth
+
+	// RelayIdleTimeout is the idle deadline for a relay->upstream TUN bridge.
+	// 0 = use defaultRelayIdleTimeout. A bridge with no traffic in either
+	// direction for this long is force-closed to reap half-open downstreams.
+	RelayIdleTimeout time.Duration
+
+	// RelayUpstreamBufBytes overrides the SO_RCVBUF/SO_SNDBUF size set on the TCP
+	// connection to the upstream exit. 0 = use defaultUpstreamSockBuf (512KB).
+	// Each relay bridge commits these buffers, so this is a direct memory
+	// multiplier on a relay node under load.
+	RelayUpstreamBufBytes int
+
+	// QUIC mode
+	QUICEnabled           bool   // Enable QUIC listener
+	QUICListenAddr        string // e.g., ":443" (UDP)
+	QUICSNIFragReassembly bool   // Enable SNI fragment reassembly for GFW bypass
+
+	// IP Pool for TUN mode (auto IP assignment)
+	IPPoolNetwork   string        // CIDR range, e.g., "10.8.0.0/24"
+	IPPoolLeaseTime time.Duration // Lease duration (0 = permanent)
+
+	// IPPoolV6 is the IPv6 prefix for TUN dual-stack clients, e.g.
+	// "fd00:10:8::/64". When set, the pool derives per-client v6 addresses
+	// (prefix with the client v4 in the low 32 bits, server at prefix::1),
+	// the shared TUN and dispatcher route v6 downlink traffic, and NAT66
+	// masquerades the prefix on the WAN. A client handshaking with version
+	// >= 0x04 gets the dual-stack flag and a trailing
+	// [serverIP6:16][clientIP6:16] block in its handshake response.
+	IPPoolV6 string
+
+	// Port hopping (multi-port listening)
+	PortRange         string        // Single port ("995") or range ("47000-47100")
+	PortRangeMaxPorts int           // Maximum number of ports to open (default: 50)
+	PortHopInterval   time.Duration // Hop interval hint for clients (default: 60s)
+	PortHopStrategy   string        // Strategy hint: "random", "sequential", "fibonacci" (default: "random")
+	PortHopSeed       string        // Optional seed for deterministic hopping
+
+	// MaxConcurrentConns caps the number of simultaneously in-flight incoming
+	// TCP connections (admission control). Under a DPI reconnect storm the
+	// accept-loop would otherwise spawn unbounded goroutines, each holding a
+	// peek-buffer, leading to OOM. 0 = use defaultMaxConcurrentConns.
+	MaxConcurrentConns int
+
+	// IPv6 Support
+	// ListenAddrV6 is the IPv6 listen address. Empty means "derive it from
+	// ListenAddr" — same port, host [::] — see resolveListenAddrV6.
+	ListenAddrV6 string
+	EnableIPv6   bool // default: true
+	DualStack    bool // default: true
+
+	// EnableICMP enables the ICMP tunnel server (requires CAP_NET_RAW).
+	// If the process lacks the capability, the listener is silently skipped.
+	EnableICMP bool
+
+	// SeqovlPacketDrop requests the server-side input NFQUEUE drop for the
+	// packet-level (level A) seqovl overlap. Currently a stub: the client's
+	// default safe geometry needs no server drop, so enabling this only logs
+	// that the aggressive overlap-into-ClientHello variant is not yet supported.
+	// See internal/geneva/overlap_server.go (OverlapServerDropper).
+	SeqovlPacketDrop bool
+
+	// REALITYCoverDomain is the domain to proxy unauthorized REALITY connections
+	// to, making the server look like a legitimate HTTPS endpoint when probed.
+	// Must be a hostname without port (port 443 is used).
+	// If empty, unauthorized REALITY connections are silently dropped.
+	REALITYCoverDomain string
+
+	// NodeMaxClients caps distinct authenticated clients on this node. 0 = off.
+	//
+	// The vector is address reputation, and it is the only confirmed one that
+	// ignores what our traffic looks like: on 2026-08-04 one of two identical
+	// servers inside a /24 was banned and the other was not. The Iranian
+	// numbers are the ones to hold in mind - 200 users on an address bought two
+	// hours, 5 to 7 bought two days.
+	//
+	// Enforced only after a client authenticates, so a prober can never observe
+	// it. See nodecap.go.
+	NodeMaxClients int
+
+	// NodeMaxBytesPerWindow caps traffic carried in one window. 0 = off.
+	// This is the ceiling that carries meaning on a relay, where the peers are
+	// downstream nodes rather than people.
+	NodeMaxBytesPerWindow int64
+
+	// NodeWindow is the sliding window the traffic ceiling is measured over.
+	// 0 = one hour.
+	NodeWindow time.Duration
+
+	// REALITYRequireDataV2 rejects clients that do not negotiate the v2 data
+	// layer (per-connection X25519 keys + ChaCha20-Poly1305). Off during the
+	// rollout so upgraded exits keep serving older clients; turn it on once
+	// every client in the deployment is upgraded, to close the downgrade path
+	// an active attacker could otherwise force by mangling the padding block.
+	REALITYRequireDataV2 bool
+
+	// REALITYPrivateKey is the server's static X25519 key, base64 (raw url).
+	// The B1 session_id authentication key is derived from it, and so is the
+	// certificate HMAC that lets a client authenticate the server without a CA
+	// once B1.5 lands - one key, both directions. Required when REALITYB1Enabled
+	// is set; the server refuses to start without it rather than generating a
+	// throwaway that would drop every client on the next restart.
+	//
+	// Falls back to TIREDVPN_REALITY_PRIVATE_KEY so it need not sit in the
+	// process command line where any local user can read it.
+	REALITYPrivateKey string
+
+	// REALITYB1Enabled accepts the B1 transport: a real TLS 1.3 handshake with
+	// authentication carried in session_id.
+	REALITYB1Enabled bool
+
+	// REALITYLegacyEnabled accepts the old transport, the one that hides
+	// credentials in padding extension 0x0015. Switch it off once
+	// reality_auth_legacy_total stops growing.
+	REALITYLegacyEnabled bool
+
+	// REALITYMaxTimeDiff is the client clock skew tolerated by B1
+	// authentication, in seconds. 0 disables the check.
+	REALITYMaxTimeDiff int
+
+	// REALITYMinClientVer is the lowest client version accepted, "X.Y.Z".
+	// Empty disables the check, which is where the first B1 release leaves it.
+	REALITYMinClientVer string
+
+	// REALITYMirrorMode selects how much of the handshake is mirrored to the
+	// real donor site: "off" mirrors nothing, "adaptive" opens a donor
+	// connection only for sources we have not seen before, "always" mirrors
+	// every connection the way the upstream reference does.
+	//
+	// B1 implements "off" only; the other two arrive with B1.5 and are
+	// validated here so a config written against that release fails loudly on
+	// an older binary instead of quietly mirroring nothing.
+	REALITYMirrorMode string
+
+	// BurstReshape turns on the nudge/ack exchange that splits the inner TLS
+	// handshake so the nDPI burst heuristic stops matching. "off" or "on".
+	//
+	// It must be set the same way on the client: a server that reshapes while
+	// the client does not will prepend noise to the client's data. There is no
+	// negotiation for it at that layer, so the rollout has to flip both ends.
+	BurstReshape string
+
+	// BurstReshapePadFlight adds this many bytes to the server flight for extra
+	// margin. Zero, i.e. off. Costs bytes on every connection and, like
+	// BurstReshape, has to match the client.
+	BurstReshapePadFlight int
+
+	// Shaper, when non-nil, is built from TOML [shaper]. The server-side
+	// pipeline does not yet consume it — server morph processing lives
+	// outside internal/strategy.MorphedConn — so this field is reserved for
+	// future wiring. Stored to keep the TOML round-trip honest.
+	Shaper any
+}
+
+// serverContext holds runtime context for multi-client mode
+type serverContext struct {
+	cfg            *Config
+	registry       *ClientRegistry
+	store          *RedisStore
+	upstreamDialer *UpstreamDialer  // for multi-hop mode
+	metrics        *Metrics         // Prometheus metrics
+	tlsConfig      *tls.Config      // TLS config for non-REALITY connections
+	ipPool         *IPPool          // IP pool for TUN mode
+	sharedTUN      *SharedTUN       // Shared TUN device for all clients
+	knockReplay    knockReplayGuard // anti-probe knock replay window (zero value usable)
+
+	// donorDialer opens the TCP connection to a REALITY donor ("host:443").
+	// Nil means net.DialTimeout, which is what production uses; tests set it
+	// so the donor fallback can be exercised without reaching the internet.
+	donorDialer func(addr string) (net.Conn, error)
+}
+
+// knockReplayGuard remembers the per-connection knock nonces seen inside the
+// replay window, so a censor who captures a client's knock cannot replay the
+// exact bytes to be let in. The zero value is usable; the map is created on
+// first use. Nonces expire after knockReplayTTL, which covers the bucket grace
+// window on both sides.
+type knockReplayGuard struct {
+	mu   sync.Mutex
+	seen map[string]int64 // nonce -> expiry (unix nanos)
+}
+
+// knockReplayTTL bounds how long a nonce is remembered. It only has to exceed
+// the bucket freshness window (a captured knock stops matching once its bucket
+// drifts out of KnockBucketFresh anyway); three minutes comfortably covers the
+// grace window on both sides and keeps the cache small.
+const knockReplayTTL = 3 * time.Minute
+
+// checkAndRecord reports whether nonce is fresh (not seen inside the window) and
+// records it. A false return means a replay.
+func (g *knockReplayGuard) checkAndRecord(nonce []byte, ttl time.Duration) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	nowNanos := time.Now().UnixNano()
+	if g.seen == nil {
+		g.seen = make(map[string]int64)
+	}
+	// Opportunistic cleanup: the cache never holds more than the window's worth
+	// of live knocks, and probes that fail the tag never reach here.
+	for k, exp := range g.seen {
+		if nowNanos > exp {
+			delete(g.seen, k)
+		}
+	}
+
+	key := string(nonce)
+	if exp, ok := g.seen[key]; ok && nowNanos <= exp {
+		return false // replay inside the window
+	}
+	g.seen[key] = time.Now().Add(ttl).UnixNano()
+	return true
+}
+
+// Run starts the server with the given configuration
+func Run(cfg *Config) error {
+	if cfg.Debug {
+		log.SetDebug(true)
+	}
+
+	initAdmissionControl(cfg)
+	initNodeCap(cfg)
+
+	if err := validateREALITYConfig(cfg); err != nil {
+		return fmt.Errorf("reality configuration: %w", err)
+	}
+
+	if err := InitREALITYKeys(cfg); err != nil {
+		return fmt.Errorf("reality initialization failed: %w", err)
+	}
+
+	caps := capabilities.Probe()
+	log.Info("capabilities: %s", caps)
+	if cfg.EnableICMP && !caps.HasNetRaw {
+		log.Warn("ICMP tunnel disabled: CAP_NET_RAW required")
+		cfg.EnableICMP = false
+	}
+	if !caps.HasTUNDevice {
+		log.Warn("TUN device /dev/net/tun not available")
+	}
+	if cfg.SeqovlPacketDrop {
+		// The client's default safe overlap geometry keeps the fake segment
+		// below rcv_nxt, so the kernel discards it on its own. The input NFQUEUE
+		// drop is only needed for the aggressive overlap-into-ClientHello variant,
+		// which is not implemented yet (see geneva.OverlapServerDropper).
+		log.Warn("seqovl -seqovl-packet-drop set but server-side overlap drop is not implemented; safe client geometry needs no drop")
+		cfg.SeqovlPacketDrop = false
+	}
+
+	srvCtx := &serverContext{cfg: cfg}
+
+	if err := initClientMode(cfg, srvCtx); err != nil {
+		return err
+	}
+
+	if err := initUpstreamMode(cfg, srvCtx); err != nil {
+		return err
+	}
+
+	if err := initIPPool(cfg, srvCtx); err != nil {
+		return err
+	}
+
+	if err := initTLSConfig(cfg, srvCtx); err != nil {
+		return err
+	}
+
+	listener, err := createTCPListener(cfg)
+	if err != nil {
+		return err
+	}
+
+	log.Info("Debug mode: %v", cfg.Debug)
+
+	quicServer := startQUICServer(cfg, srvCtx)
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go handleShutdownSignal(sigChan, srvCtx, quicServer, listener)
+
+	if cfg.EnableIPv6 {
+		// Derived here rather than at flag-parse time so every way of building
+		// a Config ends up under the same rule.
+		addrV6, derived, err := resolveListenAddrV6(cfg)
+		switch {
+		case err != nil:
+			log.Warn("IPv6 listener disabled: %v", err)
+		case derived:
+			log.Info("Starting dual-stack mode: IPv4 and IPv6 on %s (derived from -listen %s; pass -listen-v6 to override)", addrV6, cfg.ListenAddr)
+		default:
+			log.Info("Starting dual-stack mode: IPv4 and IPv6 on %s", addrV6)
+		}
+		if err == nil {
+			go func() {
+				if err := startIPv6Listener(addrV6, srvCtx); err != nil {
+					log.Error("IPv6 listener failed: %v", err)
+				}
+			}()
+		}
+	}
+
+	if cfg.EnableICMP {
+		go startICMPServer(srvCtx)
+	}
+
+	// Surface a TUN-incapable exit at boot instead of failing every native
+	// full-tunnel client silently per-connection (issue #51). A proxy-only
+	// deployment without TUN is legitimate, so warn rather than abort.
+	if ok, reason := tunModeReady(srvCtx); !ok {
+		log.Warn("TUN mode unavailable: %s", reason)
+	}
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			// handleShutdownSignal closes the listener, after which Accept
+			// fails forever: without this the loop would spin on continue at
+			// full CPU until the process is killed. A closed listener is the
+			// only clean way out of Run, so it is also the only path that
+			// returns nil.
+			if errors.Is(err, net.ErrClosed) {
+				log.Info("Listener closed, server stopped accepting connections")
+				return nil
+			}
+			log.Debug("Accept error: %v", err)
+			continue
+		}
+		connID := atomic.AddUint64(&connCounter, 1)
+		acceptConnection(conn, srvCtx, connID)
+	}
+}
+
+// initClientMode sets up multi-client (Redis) or single-secret mode.
+func initClientMode(cfg *Config, srvCtx *serverContext) error {
+	if cfg.RedisAddr != "" {
+		return initRedisMode(cfg, srvCtx)
+	}
+	if len(cfg.Secret) == 0 {
+		return fmt.Errorf("secret is required: set -secret flag or TIREDVPN_SECRET env variable")
+	}
+	secretHash := sha256.Sum256(cfg.Secret)
+	log.Debug("Single-client mode, secret hash: %x", secretHash[:8])
+	return nil
+}
+
+// initRedisMode initialises Redis store, client registry, API server and stats flush.
+func initRedisMode(cfg *Config, srvCtx *serverContext) error {
+	store, err := NewRedisStore(cfg.RedisAddr, cfg.RedisDB, cfg.RedisPrefix)
+	if err != nil {
+		return fmt.Errorf("redis connection failed: %w", err)
+	}
+	srvCtx.store = store
+
+	registry := NewClientRegistry(store)
+	ctx := context.Background()
+	if err := registry.Start(ctx); err != nil {
+		return fmt.Errorf("registry start failed: %w", err)
+	}
+	srvCtx.registry = registry
+
+	log.Info("Multi-client mode enabled with Redis at %s (db=%d, prefix=%q)", cfg.RedisAddr, store.DB(), store.Prefix())
+
+	if cfg.APIAddr == "" {
+		cfg.APIAddr = "127.0.0.1:8080"
+	}
+	api := NewAPIServer(registry, store, cfg.APIAddr, cfg.APIToken)
+	srvCtx.metrics = api.Metrics()
+	go func() {
+		if err := api.Start(ctx); err != nil {
+			log.Error("API server error: %v", err)
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			registry.FlushStats(ctx)
+		}
+	}()
+	return nil
+}
+
+// initUpstreamMode configures multi-hop upstream dialer.
+func initUpstreamMode(cfg *Config, srvCtx *serverContext) error {
+	if cfg.UpstreamAddr == "" {
+		return nil
+	}
+	if cfg.UpstreamSecret == "" {
+		return fmt.Errorf("upstream-secret required when using upstream mode")
+	}
+	dialer := NewUpstreamDialer(cfg.UpstreamAddr, []byte(cfg.UpstreamSecret))
+	if cfg.RelayUpstreamBufBytes > 0 {
+		dialer.sockBufBytes = cfg.RelayUpstreamBufBytes
+	}
+	srvCtx.upstreamDialer = dialer
+	log.Info("Upstream mode enabled: %s", cfg.UpstreamAddr)
+	return nil
+}
+
+// tunModeReady reports whether this instance can serve native full-tunnel (TUN
+// mode) clients such as the Android app. Relays forward TUN packets to an
+// upstream exit and never need a local TUN; exits need the shared TUN device,
+// which only exists when -ip-pool is configured (see initIPPool). Returns false
+// with an actionable reason when a native TUN client would be rejected at
+// connect time with "Shared TUN not initialized" (issue #51).
+func tunModeReady(srvCtx *serverContext) (bool, string) {
+	if srvCtx == nil {
+		return false, "server context not initialized"
+	}
+	if srvCtx.upstreamDialer != nil {
+		// Relay: TUN packets are forwarded upstream, no local TUN required.
+		return true, ""
+	}
+	if srvCtx.sharedTUN == nil {
+		return false, "shared TUN not initialized (server started without -ip-pool); native full-tunnel clients (e.g. Android) will be rejected — set -ip-pool (e.g. 10.8.0.0/24) to enable"
+	}
+	return true, ""
+}
+
+// initIPPool initialises the IP pool and shared TUN device for TUN mode.
+func initIPPool(cfg *Config, srvCtx *serverContext) error {
+	if cfg.IPPoolNetwork == "" {
+		return nil
+	}
+
+	var redisClient *redis.Client
+	if srvCtx.store != nil {
+		redisClient = srvCtx.store.Client()
+	}
+
+	pool, err := NewIPPool(IPPoolConfig{
+		Network:   cfg.IPPoolNetwork,
+		ServerIP:  cfg.TunIP.String(),
+		LeaseTime: cfg.IPPoolLeaseTime,
+		NetworkV6: cfg.IPPoolV6,
+		KeyPrefix: cfg.RedisPrefix,
+	}, redisClient)
+	if err != nil {
+		return fmt.Errorf("IP pool initialization failed: %w", err)
+	}
+	srvCtx.ipPool = pool
+	pool.StartCleanupRoutine(context.Background(), 5*time.Minute)
+	log.Info("IP Pool enabled: %s (server=%s, lease=%v)", cfg.IPPoolNetwork, cfg.TunIP, cfg.IPPoolLeaseTime)
+
+	_, network, err := net.ParseCIDR(cfg.IPPoolNetwork)
+	if err != nil {
+		return fmt.Errorf("failed to parse IP pool network: %w", err)
+	}
+
+	tunName := cfg.TunName
+	if tunName == "" {
+		tunName = "tiredvpn0"
+	}
+	var v6m *IPv6Metrics
+	if srvCtx.metrics != nil {
+		v6m = srvCtx.metrics.ipv6Metrics
+	}
+	sharedTUN, err := NewSharedTUN(tunName, cfg.TunIP, network, resolveTunMTU(cfg), 0, pool, v6m)
+	if err != nil {
+		return fmt.Errorf("failed to create shared TUN: %w", err)
+	}
+	srvCtx.sharedTUN = sharedTUN
+	sharedTUN.StartCleanupRoutine(2*time.Minute, 5*time.Minute)
+
+	// Bring up ip_forward + NAT for the pool so client traffic egresses
+	// through the host WAN. Non-fatal: a server started without NET_ADMIN
+	// (or one behind an external NAT setup already) should still come up in
+	// a degraded-but-running state, matching the old `ExecStartPre=-` /
+	// Docker entrypoint warn-and-continue behavior this replaces.
+	if err := tun.SetupServerNAT(cfg.IPPoolNetwork, os.Getenv("TIREDVPN_WAN_IFACE")); err != nil {
+		log.Warn("NAT auto-config failed: %v", err)
+	}
+
+	// Dual-stack: NAT66 for the ULA pool plus a sanity check that the box can
+	// actually reach the v6 internet. Both warn-and-continue, same as v4 NAT.
+	if pool.DualStack() {
+		if err := tun.SetupServerNAT6(cfg.IPPoolV6, os.Getenv("TIREDVPN_WAN_IFACE")); err != nil {
+			log.Warn("NAT66 auto-config failed: %v", err)
+		}
+		warnIfNoGlobalIPv6Uplink()
+	}
+
+	return nil
+}
+
+// initTLSConfig loads the TLS certificate and builds the tls.Config.
+func initTLSConfig(cfg *Config, srvCtx *serverContext) error {
+	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+	if err != nil {
+		return fmt.Errorf("failed to load certificate: %w", err)
+	}
+	// Built in tlsprofile.go: it drops the ML-KEM hybrids that made our
+	// ServerHello 1088 bytes larger than every donor's, and varies the rest per
+	// node so one JARM query stops tying the fleet together.
+	srvCtx.tlsConfig = buildTLSProfile(cfg, cert)
+	return nil
+}
+
+// createTCPListener creates the main TCP listener (multi-port or single-port).
+func createTCPListener(cfg *Config) (net.Listener, error) {
+	if cfg.PortRange != "" {
+		return createMultiPortTCPListener(cfg)
+	}
+	addr := cfg.ListenAddr
+	if strings.HasPrefix(addr, ":") {
+		addr = "0.0.0.0" + addr
+	}
+	l, err := net.Listen("tcp4", addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to listen: %w", err)
+	}
+	log.Info("tiredvpn server %s listening on %s", Version, cfg.ListenAddr)
+	return l, nil
+}
+
+// createMultiPortTCPListener creates a MultiPortListener from the port-range config.
+func createMultiPortTCPListener(cfg *Config) (net.Listener, error) {
+	host, mainPortStr, err := net.SplitHostPort(cfg.ListenAddr)
+	if err != nil {
+		host = "0.0.0.0"
+		mainPortStr = ""
+	}
+
+	maxPorts := cfg.PortRangeMaxPorts
+	if maxPorts <= 0 {
+		maxPorts = 50
+	}
+
+	rangePorts, err := ParsePortRange(cfg.PortRange, maxPorts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse port range: %w", err)
+	}
+
+	allPorts := mergeMainPort(mainPortStr, rangePorts, true)
+	mpl, err := NewMultiPortListener(host, allPorts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create multi-port listener: %w", err)
+	}
+	log.Info("tiredvpn server %s listening on %d TCP ports (main: %s, range: %s)", Version, mpl.NumPorts(), mainPortStr, cfg.PortRange)
+	return mpl, nil
+}
+
+// mergeMainPort prepends mainPortStr to ports if not already present.
+// logIfAdded logs when the main port is added (used for TCP listener only).
+func mergeMainPort(mainPortStr string, rangePorts []int, logIfAdded bool) []int {
+	if mainPortStr == "" {
+		return rangePorts
+	}
+	mainPort, perr := strconv.Atoi(mainPortStr)
+	if perr != nil || mainPort <= 0 || mainPort >= 65536 {
+		return rangePorts
+	}
+	for _, p := range rangePorts {
+		if p == mainPort {
+			return rangePorts
+		}
+	}
+	if logIfAdded {
+		log.Info("Including main port %d in addition to port hopping range", mainPort)
+	}
+	return append([]int{mainPort}, rangePorts...)
+}
+
+// startQUICServer starts the QUIC UDP server if enabled; returns nil if disabled.
+func startQUICServer(cfg *Config, srvCtx *serverContext) *strategy.QUICServer {
+	if !cfg.QUICEnabled {
+		return nil
+	}
+	checkUDPBufferSizes()
+
+	quicAddr := cfg.QUICListenAddr
+	if quicAddr == "" {
+		quicAddr = cfg.ListenAddr
+	}
+
+	quicCfg := buildQUICServerConfig(cfg, srvCtx, quicAddr)
+	srv := strategy.NewQUICServer(quicCfg)
+
+	// QUIC server lifecycle is driven by srv.Stop() (closes its internal stopChan),
+	// invoked from handleShutdownSignal. acceptLoop selects on stopChan for both
+	// shutdown and interruptible accept-error backoff, so a non-cancelable
+	// background context here does not block shutdown or cause CPU spin.
+	ctx := context.Background()
+	err := srv.Start(ctx, func(conn net.Conn) {
+		connID := atomic.AddUint64(&connCounter, 1)
+		handleQUICConnection(conn, srvCtx, connID)
+	})
+	if err != nil {
+		log.Error("Failed to start QUIC server: %v", err)
+		return nil
+	}
+	if len(quicCfg.Ports) > 0 {
+		log.Info("QUIC server listening on %d UDP ports (port hopping enabled)", len(quicCfg.Ports))
+	} else {
+		log.Info("QUIC server listening on %s (UDP)", quicAddr)
+	}
+	return srv
+}
+
+// buildQUICServerConfig constructs strategy.QUICServerConfig including multi-port UDP support.
+func buildQUICServerConfig(cfg *Config, srvCtx *serverContext, quicAddr string) strategy.QUICServerConfig {
+	qcfg := strategy.QUICServerConfig{
+		ListenAddr:            quicAddr,
+		CertFile:              cfg.CertFile,
+		KeyFile:               cfg.KeyFile,
+		Secret:                cfg.Secret,
+		SNIFragmentReassembly: cfg.QUICSNIFragReassembly,
+		GetClientSecrets: func() []strategy.SecretInfo {
+			if srvCtx.registry == nil {
+				return nil
+			}
+			clients := srvCtx.registry.ListClients()
+			secrets := make([]strategy.SecretInfo, 0, len(clients))
+			for _, c := range clients {
+				secrets = append(secrets, strategy.SecretInfo{
+					Secret:   []byte(c.Secret),
+					ClientID: c.ID,
+					Name:     c.Name,
+				})
+			}
+			return secrets
+		},
+	}
+
+	if cfg.PortRange == "" {
+		return qcfg
+	}
+
+	maxPorts := cfg.PortRangeMaxPorts
+	if maxPorts <= 0 {
+		maxPorts = 50
+	}
+	rangePorts, err := ParsePortRange(cfg.PortRange, maxPorts)
+	if err != nil {
+		log.Warn("QUIC: failed to parse port range: %v, using single port", err)
+		return qcfg
+	}
+	if len(rangePorts) == 0 {
+		return qcfg
+	}
+
+	_, mainPortStr, _ := net.SplitHostPort(quicAddr)
+	allPorts := mergeMainPort(mainPortStr, rangePorts, false)
+	qcfg.Ports = allPorts
+	log.Info("QUIC multi-port mode: %d UDP ports configured", len(allPorts))
+	return qcfg
+}
+
+// handleShutdownSignal waits for OS signal and performs graceful shutdown.
+func handleShutdownSignal(sigChan chan os.Signal, srvCtx *serverContext, quicServer *strategy.QUICServer, listener net.Listener) {
+	sig := <-sigChan
+	log.Info("Received signal %v, shutting down...", sig)
+	if srvCtx.registry != nil {
+		srvCtx.registry.Stop()
+	}
+	if srvCtx.store != nil {
+		srvCtx.store.Close()
+	}
+	if quicServer != nil {
+		quicServer.Stop()
+	}
+	listener.Close()
+	os.Exit(0)
+}
+
+// runDualStackListeners starts both IPv4 and IPv6 listeners in parallel
+// startIPv6Listener creates and runs IPv6 listener
+func startIPv6Listener(addr string, srvCtx *serverContext) error {
+	lc := net.ListenConfig{}
+	listener, err := lc.Listen(context.Background(), "tcp6", addr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on IPv6: %w", err)
+	}
+	defer listener.Close()
+
+	log.Info("Server listening on IPv6: %s", addr)
+
+	// Accept connections
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Debug("IPv6 accept error: %v", err)
+			continue
+		}
+
+		// Log IPv6 client
+		if tcpConn, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+			log.Info("IPv6 client connected: %s", tcpConn.IP)
+		}
+
+		connID := atomic.AddUint64(&connCounter, 1)
+		acceptConnection(conn, srvCtx, connID)
+	}
+}
+
+// handleQUICConnection handles authenticated QUIC connections
+func handleQUICConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
+	defer conn.Close()
+
+	remoteAddr := conn.RemoteAddr().String()
+	logger := log.WithPrefix(fmt.Sprintf("quic:%d", connID))
+
+	logger.Info("QUIC connection from %s (authenticated)", remoteAddr)
+
+	// Extract clientID from QUICServerConn if available
+	var clientID clientIdentity
+	if qc, ok := conn.(*strategy.QUICServerConn); ok {
+		if qc.ClientIDFromRegistry {
+			clientID = registryIdentity(qc.ClientID)
+		} else {
+			clientID = sharedIdentity(qc.ClientID)
+		}
+	}
+
+	// Track per-client connection for metrics
+	if srvCtx.registry != nil && clientID.id != "" {
+		if err := srvCtx.registry.AddConnection(clientID.id, conn); err != nil {
+			logger.Warn("Failed to track QUIC connection for client %s: %v", clientID, err)
+		} else {
+			defer srvCtx.registry.RemoveConnection(clientID.id, conn)
+		}
+	}
+
+	// Read first byte to determine mode
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	modeBuf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, modeBuf); err != nil {
+		logger.Debug("Failed to read mode byte: %v", err)
+		return
+	}
+
+	// Check if this is TUN mode (0x02)
+	if modeBuf[0] == 0x02 {
+		logger.Debug("QUIC TUN mode detected, clientID=%s", clientID)
+		// Read rest of TUN handshake: [localIP:4][mtu:2][version:1]
+		// Read 7 bytes to support version detection, but legacy clients only send 6
+		tunData := make([]byte, 7)
+		n, err := conn.Read(tunData)
+		if err != nil || n < 6 {
+			logger.Debug("Failed to read TUN handshake: %v (got %d bytes)", err, n)
+			return
+		}
+		// Call TUN handler with pre-read handshake and clientID
+		handleTUNModeWithHandshake(conn, srvCtx, logger, tunData[:n], clientID)
+		return
+	}
+
+	// Regular SOCKS mode - first byte is high byte of address length
+	// Read second byte of address length
+	lenBuf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, lenBuf); err != nil {
+		logger.Debug("Failed to read address length: %v", err)
+		return
+	}
+
+	addrLen := int(modeBuf[0])<<8 | int(lenBuf[0])
+	if addrLen < 3 || addrLen > 256 {
+		logger.Debug("Invalid address length: %d", addrLen)
+		return
+	}
+
+	addrBuf := make([]byte, addrLen)
+	if _, err := io.ReadFull(conn, addrBuf); err != nil {
+		logger.Debug("Failed to read address: %v", err)
+		return
+	}
+
+	targetAddr := string(addrBuf)
+	logger.Info("QUIC tunnel to: %s", targetAddr)
+
+	// Connect to target
+	var targetConn net.Conn
+	var err error
+	if srvCtx.upstreamDialer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		cancel()
+	} else {
+		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
+	}
+
+	if err != nil {
+		logger.Warn("Failed to connect to %s: %v", targetAddr, err)
+		// Send failure response: [0x01]
+		conn.Write([]byte{0x01})
+		return
+	}
+	defer targetConn.Close()
+
+	// Send success response: [0x00]
+	conn.Write([]byte{0x00})
+	logger.Debug("Connected to target, starting QUIC relay")
+
+	// Clear deadline for relay
+	conn.SetReadDeadline(time.Time{})
+
+	// Simple bidirectional relay (no framing needed for QUIC - it handles multiplexing)
+	var wg sync.WaitGroup
+	var bytesUp, bytesDown int64
+
+	wg.Add(2)
+
+	// Client -> Target
+	go func() {
+		defer wg.Done()
+		n, _ := optimizedRelay(targetConn, conn)
+		atomic.AddInt64(&bytesUp, n)
+	}()
+
+	// Target -> Client
+	go func() {
+		defer wg.Done()
+		n, _ := optimizedRelay(conn, targetConn)
+		atomic.AddInt64(&bytesDown, n)
+	}()
+
+	wg.Wait()
+	logger.Info("QUIC relay closed: up=%d down=%d", bytesUp, bytesDown)
+
+	// Update metrics
+	if srvCtx.metrics != nil {
+		srvCtx.metrics.AddBytes(bytesUp, bytesDown)
+	}
+
+	// Update per-client metrics
+	if srvCtx.registry != nil && clientID.id != "" {
+		srvCtx.registry.AddBytes(clientID.id, bytesUp, bytesDown)
+	}
+}
+
+// readFirstPeek reads the first framing unit from conn for protocol
+// classification: a full TLS record when the 5-byte header is a handshake
+// record, otherwise up to ~2KB of non-TLS data. It preserves the original
+// deadline handling (probeReadDeadline for the header, 30s for the record body)
+// and the partial-REALITY tolerance (DPI may drop trailing padding). ok is false
+// on a fatal read error; the caller then serves the fake website.
+//
+// It is called once per connection, and again for each leading seqovl decoy
+// record that must be skipped before the real first flight.
+func readFirstPeek(conn net.Conn, logger *log.Logger) (header, peekBuf []byte, ok bool) {
+	// Set a short initial read deadline for the (still unclassified) connection.
+	// A probe that connects but never sends a valid handshake must not pin a
+	// goroutine and its peek-buffer for 30s under a reconnect storm. A real
+	// ClientHello arrives well within probeReadDeadline; once the TLS record is
+	// being read the deadline is extended below for fragmented handshakes.
+	conn.SetReadDeadline(time.Now().Add(probeReadDeadline))
+
+	// Peek first bytes to detect protocol
+	// First read TLS record header (5 bytes) to get record length
+	header = make([]byte, 5)
+	n, err := io.ReadFull(conn, header)
+	if err != nil || n < 5 {
+		logger.Debug("Failed to read header: %v (read %d bytes)", err, n)
+		return nil, nil, false
+	}
+
+	// For TLS records, read full record to catch REALITY extension in padding
+	if header[0] == 0x16 { // TLS Handshake
+		recordLen := int(header[3])<<8 | int(header[4])
+		logger.Debug("TLS header received: %02x %02x %02x %02x %02x (record_len=%d, 0x%04x)",
+			header[0], header[1], header[2], header[3], header[4], recordLen, recordLen)
+		if recordLen > 16384 { // Max TLS record size
+			recordLen = 16384
+		}
+		peekBuf = make([]byte, 5+recordLen)
+		copy(peekBuf, header)
+
+		// Read TLS record in chunks to support heavily fragmented ClientHello.
+		// Morph strategy sends ~750 fragments of 2 bytes each (1ms delay between).
+		// Per-chunk timeouts cause false failures under congestion (parallel probing).
+		// Use a single overall deadline instead.
+		totalRead := 0
+		startTime := time.Now()
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+		for totalRead < recordLen {
+			chunkSize := recordLen - totalRead
+			if chunkSize > 4096 {
+				chunkSize = 4096
+			}
+
+			n, err := io.ReadAtLeast(conn, peekBuf[5+totalRead:5+totalRead+chunkSize], 1)
+			if err != nil {
+				// DPI may drop trailing bytes of a REALITY ClientHello (random padding).
+				// peekBuf is zero-initialized so missing bytes are already zeroed.
+				// If REALITY is detectable in what we received, proceed with zero-padded record.
+				if totalRead > 0 && DetectREALITYExtension(peekBuf[:5+totalRead]) {
+					logger.Debug("Partial REALITY ClientHello: %d/%d bytes, zero-padding remainder", totalRead, recordLen)
+					break
+				}
+				logger.Debug("Failed to read TLS record: %v (read %d/%d bytes)",
+					err, totalRead, recordLen)
+				return nil, nil, false
+			}
+
+			totalRead += n
+			logger.Debug("Read chunk: %d bytes (total: %d/%d)", n, totalRead, recordLen)
+		}
+
+		logger.Debug("Completed reading TLS payload: %d bytes in %v", totalRead, time.Since(startTime))
+
+		// Reset deadline for subsequent operations
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	} else {
+		// Non-TLS: read available data (up to 2048 bytes)
+		restBuf := make([]byte, 2043)
+		n, _ := io.ReadAtLeast(conn, restBuf, 1)
+		peekBuf = make([]byte, 5+n)
+		copy(peekBuf, header)
+		copy(peekBuf[5:], restBuf[:n])
+	}
+
+	return header, peekBuf, true
+}
+
+func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
+	cfg := srvCtx.cfg
+	defer conn.Close()
+
+	// Track connection metrics
+	if srvCtx.metrics != nil {
+		srvCtx.metrics.IncConnections()
+		defer srvCtx.metrics.DecConnections()
+	}
+
+	remoteAddr := conn.RemoteAddr().String()
+	logger := log.WithPrefix(fmt.Sprintf("conn:%d", connID))
+
+	logger.Info("New connection from %s", remoteAddr)
+
+	// Read the first framing unit (full TLS record or non-TLS peek) for protocol
+	// classification.
+	header, peekBuf, ok := readFirstPeek(conn, logger)
+	if !ok {
+		serveFakeWebsite(conn, cfg, logger)
+		return
+	}
+
+	// seqovl (level B): the client may prepend one or more secret-marked decoy
+	// TLS records before the real ClientHello to desync stateful DPI reassembly.
+	// Drop any leading decoy(s) so the real first flight classifies normally. The
+	// isSeqovlDecoy gate is additive — a genuine ClientHello (payload[0]==0x01) is
+	// rejected before any HMAC, so REALITY / Geneva / Morph are unaffected.
+	decoyCount := 0
+	for header[0] == 0x16 && isSeqovlDecoy(peekBuf, srvCtx) {
+		decoyCount++
+		if decoyCount > seqovlMaxDecoys {
+			logger.Debug("seqovl: decoy limit (%d) exceeded, serving fake website", seqovlMaxDecoys)
+			serveFakeWebsite(conn, cfg, logger)
+			return
+		}
+		logger.Debug("seqovl: dropped decoy record (%d bytes), reading real first flight", len(peekBuf))
+		header, peekBuf, ok = readFirstPeek(conn, logger)
+		if !ok {
+			serveFakeWebsite(conn, cfg, logger)
+			return
+		}
+	}
+
+	logger.Debug("First %d bytes: %s", len(peekBuf), log.HexDump(peekBuf, 32))
+
+	// Create buffered connection with peeked data
+	buffConn := &bufferedConn{
+		Conn:   conn,
+		reader: io.MultiReader(bytes.NewReader(peekBuf), conn),
+	}
+
+	// Check for HTTP/2 preface
+	if string(peekBuf) == http2.ClientPreface {
+		logger.Debug("Detected HTTP/2 protocol")
+		handleHTTP2(buffConn, srvCtx, logger)
+		return
+	}
+
+	// Check for Morph protocol magic "MRPH"
+	if bytes.HasPrefix(peekBuf, []byte("MRPH")) {
+		logger.Debug("Detected Morph protocol")
+		handleMorphConnection(buffConn, srvCtx, logger)
+		return
+	}
+
+	// REALITY, newest transport first. B1 claims a connection by parsing the
+	// authentication out of session_id; only if it declines do we look for the
+	// legacy padding extension. Order matters: a B1 ClientHello carries no
+	// padding-ext credentials, so the legacy detector would misfile it as an
+	// ordinary TLS handshake and serve the fake website.
+	if srvCtx.cfg.REALITYB1Enabled {
+		if tryREALITYB1(buffConn, peekBuf, srvCtx, logger) {
+			return
+		}
+	}
+	if srvCtx.cfg.REALITYLegacyEnabled && DetectREALITYExtension(peekBuf) {
+		logger.Debug("Padding extension present, trying the REALITY transport")
+		claimed, hello := HandleREALITYConnection(buffConn, srvCtx, logger)
+		if claimed {
+			return
+		}
+		// Not one of ours: an ordinary client whose ClientHello carries a real
+		// padding extension, which OpenSSL adds to anything between 256 and 511
+		// bytes. Replay the hello and continue down the ordinary TLS path, so
+		// it gets the same answer as any other connection. Dropping it here is
+		// what made a padding extension a one-packet way to recognise us.
+		logger.Debug("REALITY did not claim the connection, continuing as ordinary TLS")
+		buffConn = &bufferedConn{
+			Conn:   conn,
+			reader: io.MultiReader(bytes.NewReader(hello), conn),
+		}
+	}
+
+	// Check if this is a TLS ClientHello (without REALITY extension)
+	// We need to perform TLS handshake first, then detect inner protocol
+	if len(peekBuf) > 0 && peekBuf[0] == 0x16 {
+		logger.Debug("TLS ClientHello detected (no REALITY extension), performing TLS handshake")
+
+		// Imitate the donor's tolerance for ChangeCipherSpec floods before the
+		// handshake starts, so a prober measuring us measures the site we claim
+		// to be. See ccsguard.go; the name comes from the peek buffer we
+		// already parsed.
+		sni, _ := ExtractSNI(peekBuf)
+		guard := newCCSGuard(buffConn, sni)
+
+		// Wrap buffered connection with TLS
+		tlsConn := tls.Server(guard, srvCtx.tlsConfig)
+		err := tlsConn.Handshake()
+		guard.handshakeDone()
+		if err != nil {
+			// Close, the way the B1 path does. Handing the raw socket to the
+			// fake website here answered a peer that had opened a TLS handshake
+			// with a plaintext HTTP response on the same connection - measured,
+			// not supposed: break the handshake with a bogus record, then send
+			// "GET / HTTP/1.1" and our server replied "HTTP/1.1 200 OK, Server:
+			// nginx". No HTTPS server on earth does that, so it identified us in
+			// one connection with no statistics and no timing.
+			//
+			// crypto/tls has already sent whatever alert the failure warrants,
+			// so closing leaves exactly the behaviour a real server shows.
+			logger.Debug("TLS handshake failed: %v", err)
+			_ = tlsConn.Close()
+			return
+		}
+
+		// kTLS is enabled per-handler in the relay phase, after each protocol's
+		// auth/header bytes are fully drained from the TLS stack. See
+		// internal/ktls.TryEnable; per-protocol handlers (tired-raw, tired-confusion)
+		// call it after their auth phase completes.
+
+		// Clear deadline after successful handshake
+		tlsConn.SetReadDeadline(time.Time{})
+
+		// Now detect protocol over TLS
+		handleTLSConnection(tlsConn, srvCtx, connID)
+		return
+	}
+
+	// Non-TLS connections: check for timing knock (anti-probe) with per-client secrets.
+	// There is no TLS session to bind the server proof to on this path, and the
+	// current client always dials anti-probe over TLS, so a knock arriving in the
+	// clear cannot complete the session-bound handshake — serve the decoy.
+	if matched, _, clientID := detectTimingKnockWithRegistry(peekBuf, srvCtx); matched {
+		logger.Debug("Detected plaintext timing knock with no TLS session to bind (client: %s); serving decoy", clientID)
+		serveFakeWebsite(buffConn, srvCtx.cfg, logger)
+		return
+	}
+
+	// SSH: the confusion transport's SSH carrier and the ssh_camouflage
+	// transport both open with the same OpenSSH banner, so a passive prober
+	// reads one version from the port. They are told apart by the keyed marker
+	// the confusion carrier bears in its first flight, checked over the bytes
+	// already peeked - the ssh_camouflage client has sent only its banner and
+	// is waiting for the server, so reading on to assemble a carrier would
+	// block it until the auth timeout. Must precede protocol confusion (which
+	// also matches "SSH-2.0-") and TLS, since the SSH handshake is plaintext.
+	if bytes.HasPrefix(peekBuf, []byte("SSH-2.0")) {
+		// The confusion carrier sends its whole first flight at once (banner,
+		// KEXINIT, KEX_ECDH, NEWKEYS, sealed body); the ssh_camouflage (S2) client
+		// sends only its banner and then waits for the server. When the peek stops
+		// mid-carrier - a first flight split across TCP segments - finish it under
+		// a short window before deciding, so a fragmented carrier is not taken for
+		// the bare-banner S2 client and pushed into the camouflage handshake, where
+		// it would fail auth and cost a decoy and a retry. The S2 client sends
+		// nothing more and only waits out that short window, never the auth
+		// timeout. Bytes read are folded back into peekBuf for replay.
+		peekBuf = reassembleSSHCarrierPeek(conn, peekBuf, logger)
+		buffConn = &bufferedConn{
+			Conn:   conn,
+			reader: io.MultiReader(bytes.NewReader(peekBuf), conn),
+		}
+		if DetectSSHCamouflage(peekBuf, srvCtx) {
+			logger.Debug("Detected SSH camouflage")
+			handleSSHCamouflage(buffConn, srvCtx, logger)
+			return
+		}
+		// A confusion SSH carrier whose marker we recognize. Entry point 1 of 3
+		// into the confusion funnel; all three authenticate in classifyConfusion.
+		if sess, consumed, ok := classifyConfusion(buffConn, peekBuf, srvCtx, logger); ok {
+			logger.Debug("Detected SSH-carried protocol confusion")
+			handleProtocolConfusion(sess, srvCtx, logger)
+			return
+		} else if len(consumed) > 0 {
+			buffConn = &bufferedConn{
+				Conn:   conn,
+				reader: io.MultiReader(bytes.NewReader(consumed), conn),
+			}
+		}
+		// The peek bore a valid marker but the full carrier did not classify (a
+		// truncated first flight): hand it to the camouflage handshake rather
+		// than dropping it. A real ssh_camouflage client ends up here too.
+		logger.Debug("SSH carrier did not classify; treating as SSH camouflage")
+		handleSSHCamouflage(buffConn, srvCtx, logger)
+		return
+	}
+
+	// IMAP camouflage: plaintext Dovecot greeting ("* OK ... Dovecot ... ready")
+	// emitted by the client so this peek-based dispatch can class it. Checked
+	// alongside SSH camouflage, before protocol confusion and the fake website
+	// fallback. The "* OK" prefix never collides with TLS (0x16) or SSH.
+	if DetectIMAPCamouflage(peekBuf) {
+		logger.Debug("Detected IMAP camouflage")
+		handleIMAPCamouflage(buffConn, srvCtx, logger)
+		return
+	}
+
+	// Raw TCP protocol confusion. Entry point 1 of 3 into the confusion funnel;
+	// all three authenticate here, before the handler sees anything.
+	if sess, consumed, ok := classifyConfusion(buffConn, peekBuf, srvCtx, logger); ok {
+		logger.Debug("Detected raw TCP protocol confusion")
+		handleProtocolConfusion(sess, srvCtx, logger)
+		return
+	} else if len(consumed) > 0 {
+		// Not ours after all. Replay every byte we read so the fake website
+		// answers exactly the same connection it would have answered if this
+		// detector had never looked.
+		buffConn = &bufferedConn{
+			Conn:   conn,
+			reader: io.MultiReader(bytes.NewReader(consumed), conn),
+		}
+	}
+
+	// Unknown protocol - serve fake website
+	logger.Debug("Unknown protocol (not TLS, not timing knock), serving fake website")
+	serveFakeWebsite(buffConn, cfg, logger)
+}
+
+// handleTLSConnection handles protocols over TLS (after TLS handshake completed).
+// conn must be a fully-handshaked *tls.Conn — kTLS upgrade is deferred to each
+// per-protocol handler at the relay-phase boundary via ktls.TryEnable.
+// Routes by the first encrypted byte (protocol discriminator) sent by the client.
+func handleTLSConnection(conn *tls.Conn, srvCtx *serverContext, connID uint64) {
+	logger := log.WithPrefix(fmt.Sprintf("conn:%d", connID))
+
+	// Read 1-byte protocol discriminator (encrypted; invisible in ClientHello)
+	protoType, err := protocol.ReadDispatch(conn)
+	if err != nil {
+		logger.Debug("dispatch read failed: %v; falling back to legacy detection", err)
+		handleTLSConnectionLegacy(conn, srvCtx, connID)
+		return
+	}
+
+	logger.Debug("dispatch routing: type=0x%02x", protoType)
+
+	switch protoType {
+	case protocol.TypeStego:
+		handleHTTP2WithALPN(conn, srvCtx, logger)
+	case protocol.TypeRaw:
+		handleRawTunnel(conn, srvCtx, logger, clientIdentity{})
+	case protocol.TypeConfusion:
+		// Entry point 2 of 3. Nothing in the tree writes this discriminator, so
+		// the only peer that arrives here is one that chose to - which is
+		// exactly why it has to authenticate like the other two.
+		handleConfusionDispatch(conn, srvCtx, logger)
+	case protocol.TypeAntiProbe:
+		handleAntiProbeDispatch(conn, srvCtx, logger)
+	case protocol.TypeMorph:
+		handleMorphConnectionWithALPN(conn, srvCtx, logger)
+	case protocol.TypeWS:
+		handleWebSocketConnection(conn, srvCtx, logger)
+	case protocol.TypePolling:
+		handleHTTPPollingWithALPN(conn, srvCtx, logger)
+	default:
+		logger.Debug("unknown dispatch type 0x%02x; falling back to legacy detection", protoType)
+		// Prepend the consumed dispatch byte so legacy detectors see the full stream.
+		prefixed := &bufferedConn{
+			Conn:   conn,
+			reader: io.MultiReader(bytes.NewReader([]byte{protoType}), conn),
+		}
+		handleTLSConnectionLegacy(prefixed, srvCtx, connID)
+	}
+}
+
+// handleTLSConnectionLegacy handles TLS connections using magic-byte detection.
+// conn is net.Conn (not *tls.Conn) so callers can prepend unread bytes via bufferedConn.
+func handleTLSConnectionLegacy(conn net.Conn, srvCtx *serverContext, connID uint64) {
+	cfg := srvCtx.cfg
+	logger := log.WithPrefix(fmt.Sprintf("conn:%d", connID))
+
+	// Set read deadline for protocol detection
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	// Peek first bytes to detect protocol over TLS
+	peekBuf := make([]byte, 512)
+	n, err := io.ReadAtLeast(conn, peekBuf, 24)
+	if err != nil && n < 24 {
+		logger.Debug("Failed to peek over TLS: %v (read %d bytes)", err, n)
+		serveFakeWebsite(conn, cfg, logger)
+		return
+	}
+	peekBuf = peekBuf[:n]
+
+	logger.Debug("First %d bytes over TLS: %s", n, log.HexDump(peekBuf, 64))
+
+	// Create buffered connection with peeked data
+	buffConn := &bufferedConn{
+		Conn:   conn,
+		reader: io.MultiReader(bytes.NewReader(peekBuf), conn),
+	}
+
+	// Clear deadline
+	conn.SetReadDeadline(time.Time{})
+
+	// Check for HTTP/2 preface
+	if string(peekBuf) == http2.ClientPreface {
+		logger.Debug("Detected HTTP/2 protocol over TLS")
+		handleHTTP2(buffConn, srvCtx, logger)
+		return
+	}
+
+	// Check for Morph protocol magic "MRPH"
+	if bytes.HasPrefix(peekBuf, []byte("MRPH")) {
+		logger.Debug("Detected Morph protocol over TLS")
+		handleMorphConnection(buffConn, srvCtx, logger)
+		return
+	}
+
+	// Check for timing knock sequence (anti-probe over TLS) with per-client secrets
+	if matched, secret, clientID := detectTimingKnockWithRegistry(peekBuf, srvCtx); matched {
+		logger.Debug("Detected timing knock pattern over TLS (client: %s)", clientID)
+		ekm, err := exporterBindingKey(buffConn)
+		if err != nil {
+			logger.Debug("Anti-probe over TLS: exporter unavailable: %v", err)
+			serveFakeWebsite(buffConn, srvCtx.cfg, logger)
+			return
+		}
+		handleAntiProbeAuth(buffConn, srvCtx, secret, clientID, ekm, logger)
+		return
+	}
+
+	// Check for protocol confusion. Entry point 3 of 3. On a failed match the
+	// consumed bytes are replayed, so the WebSocket and HTTP/1 detectors below
+	// still see the connection they would have seen.
+	if sess, consumed, ok := classifyConfusion(buffConn, peekBuf, srvCtx, logger); ok {
+		logger.Debug("Detected protocol confusion over TLS")
+		handleProtocolConfusion(sess, srvCtx, logger)
+		return
+	} else if len(consumed) > 0 {
+		buffConn = &bufferedConn{
+			Conn:   conn,
+			reader: io.MultiReader(bytes.NewReader(consumed), conn),
+		}
+	}
+
+	// Check for WebSocket Padded
+	if detectWebSocketPadded(peekBuf) {
+		logger.Debug("Detected WebSocket Padded protocol over TLS")
+		handleWebSocketPadded(buffConn, srvCtx, logger)
+		return
+	}
+
+	// Check for HTTP/1.x
+	if bytes.HasPrefix(peekBuf, []byte("GET ")) ||
+		bytes.HasPrefix(peekBuf, []byte("POST ")) ||
+		bytes.HasPrefix(peekBuf, []byte("HEAD ")) {
+		logger.Debug("Detected HTTP/1.x protocol over TLS")
+		handleHTTP1(buffConn, srvCtx, logger)
+		return
+	}
+
+	// Unknown protocol - serve fake website
+	logger.Debug("Unknown protocol over TLS, serving fake website")
+	serveFakeWebsite(buffConn, cfg, logger)
+}
+
+// handleHTTP2WithALPN handles HTTP/2 Stego when ALPN was used.
+//
+// kTLS handover boundary: unlike tired-raw / tired-confusion, the HTTP/2
+// stego client streams its whole opening burst — preface + SETTINGS + auth
+// HEADERS — back-to-back without waiting for a server signal. If we enable
+// kTLS right after reading the 24-byte preface, the TLS stack has already
+// decrypted the SETTINGS/HEADERS that trailed the preface in the same TCP
+// segment into tls.Conn's internal buffer; the kernel then takes over the
+// raw socket and those decrypted bytes are lost forever. The server waits
+// for HEADERS that never arrive, the client waits for an auth ack that never
+// comes, and the handshake hangs until timeout.
+//
+// Fix: run the entire auth handshake (SETTINGS exchange + auth HEADERS +
+// auth ack) through the TLS stack, and only hand the socket to kTLS once the
+// client is authenticated. At that point the client is blocked in
+// waitForServerAck and has not sent any DATA, so tls.Conn's buffer is empty
+// and the handover is lossless. The framer is rebuilt on the kTLS wrapper
+// for the relay phase; the HPACK decoder state is carried over unchanged.
+func handleHTTP2WithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
+	logger.Debug("HTTP/2 via ALPN")
+
+	// Read the preface through the TLS stack.
+	if err := readH2Preface(conn, logger); err != nil {
+		return
+	}
+
+	framer, err := newH2Framer(conn, logger)
+	if err != nil {
+		return
+	}
+
+	hpackDec := hpack.NewDecoder(4096, nil)
+	authenticated := false
+	var authClientID clientIdentity
+	var authSecret []byte
+	var tunnel *h2TunnelState
+	var connTracked bool
+
+	// kTLS handover is intentionally disabled for the stego path.
+	//
+	// On loopback (and on fast links in general) the client pipelines relay
+	// frames immediately after the auth HEADERS before the server's handover
+	// has completed. The http2.Framer / tls.Conn pair buffers those TLS
+	// records in userspace; when the kernel takes over the raw socket its RX
+	// sequence counter is already behind → EBADMSG → RST. Staying on the
+	// userspace TLS stack for the full session avoids the sequence-number
+	// desync with no correctness impact (kTLS is only a CPU optimisation).
+
+	defer func() { cleanupH2Conn(conn, srvCtx, &tunnel, &connTracked, &authClientID) }()
+
+	// Session binding (S22): the auth token is bound to this TLS session's
+	// exporter. Pull it before the frame loop; the stego path never hands the
+	// socket to kTLS, so conn stays a userspace *tls.Conn and the exporter is
+	// reachable. An unavailable exporter yields nil, which no bound client token
+	// matches — a fast rejection, not a silent unbound accept.
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("HTTP/2 stego (ALPN): exporter unavailable: %v", ekmErr)
+	}
+
+	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &authSecret, &connTracked, &tunnel, nil, ekm)
+}
+
+// handleMorphConnectionWithALPN handles Morph protocol when ALPN was used
+// Since kTLS is already enabled, we just need to delegate to handleMorphConnection
+func handleMorphConnectionWithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
+	logger.Debug("Morph via ALPN (kTLS enabled)")
+	// handleMorphConnection expects to read the magic first
+	handleMorphConnection(conn, srvCtx, logger)
+}
+
+// h2TunnelState holds state for HTTP/2 stego tunnel
+type h2TunnelState struct {
+	targetConn      net.Conn
+	streamID        uint32
+	clientID        clientIdentity // Client identity for IP pool allocation
+	secret          []byte         // Authenticated client secret, keys the stego markers
+	remoteAddr      string         // Peer host, used to qualify the IP-pool lease key
+	mu              sync.Mutex
+	sharedTUNWriter *ClientWriter // For shared TUN mode
+	sharedTUN       *SharedTUN    // Reference to shared TUN
+	// sink is where packets from this client go: the shared TUN on an exit, the
+	// upstream tunnel on a relay. Set once the TUN handshake completes.
+	sink tunPacketSink
+	// reasmBuf accumulates inbound TUN bytes across stego DATA frames so a single
+	// [len:4][pkt:N] frame split over several payloads (relay leg uses a non-tunMode
+	// stego conn that chunks at 1000/1400 bytes) is reassembled instead of dropped.
+	// Read/written only from the single runH2FrameLoop goroutine -> no lock needed.
+	reasmBuf []byte
+	// tunGate owns every downstream write once this tunnel is in TUN mode: the
+	// handshake response, the dispatcher's frames, the keepalive echo and the
+	// auto-MTU probe reply. nil outside TUN mode.
+	tunGate *tunFrameGate
+}
+
+// h2ReasmBufLimit caps the inbound reassembly buffer. node A prod runs with swap 0, so
+// a desynced stream must not grow the buffer without bound.
+const h2ReasmBufLimit = 128 * 1024
+
+// handleHTTP2 handles HTTP/2 connections (including steganography)
+func handleHTTP2(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
+	logger.Debug("Processing HTTP/2 connection")
+
+	framer, err := initH2Framer(conn, logger)
+	if err != nil {
+		return
+	}
+
+	hpackDec := hpack.NewDecoder(4096, nil)
+
+	authenticated := false
+	var authClientID clientIdentity
+	var authSecret []byte
+	var tunnel *h2TunnelState
+	var connTracked bool
+	defer cleanupH2Conn(conn, srvCtx, &tunnel, &connTracked, &authClientID)
+
+	// Session binding (S22): bind the auth token to this TLS session's exporter.
+	// On the TLS entry path (handleTLSConnectionLegacy) conn wraps a *tls.Conn
+	// and the exporter is available; on the plaintext entry path
+	// (handleConnection) there is no TLS session and ekm is nil; verifyH2Auth
+	// turns that into material no token can match (sessionBindingOrUnmatchable),
+	// since our clients always run over TLS.
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("HTTP/2 stego: exporter unavailable: %v", ekmErr)
+	}
+
+	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &authSecret, &connTracked, &tunnel, nil, ekm)
+}
+
+// initH2Framer reads the HTTP/2 preface, creates a framer and sends server SETTINGS.
+func initH2Framer(conn net.Conn, logger *log.Logger) (*http2.Framer, error) {
+	preface := make([]byte, 24)
+	if _, err := io.ReadFull(conn, preface); err != nil {
+		logger.Debug("Failed to read HTTP/2 preface: %v", err)
+		return nil, err
+	}
+	framer := http2.NewFramer(conn, conn)
+	framer.AllowIllegalReads = true
+	framer.AllowIllegalWrites = true
+	if err := framer.WriteSettings(); err != nil {
+		logger.Debug("Failed to write SETTINGS: %v", err)
+		return nil, err
+	}
+	return framer, nil
+}
+
+// cleanupH2Conn closes tunnel target and removes per-client connection tracking on defer.
+func cleanupH2Conn(conn net.Conn, srvCtx *serverContext, tunnel **h2TunnelState, connTracked *bool, authClientID *clientIdentity) {
+	if *tunnel != nil && (*tunnel).targetConn != nil {
+		(*tunnel).targetConn.Close()
+	}
+	if *tunnel != nil && (*tunnel).sink != nil {
+		(*tunnel).sink.Close()
+	}
+	if *connTracked && srvCtx.registry != nil && authClientID.id != "" {
+		srvCtx.registry.RemoveConnection(authClientID.id, conn)
+	}
+}
+
+// runH2FrameLoop reads and dispatches HTTP/2 frames until the connection closes.
+//
+// connPtr / framerPtr are pointers so the loop can swap the connection and
+// framer in place after a kTLS handover (see handover). handover may be nil
+// (legacy non-ALPN path), in which case no kTLS upgrade happens. When set, it
+// is invoked exactly once — immediately after auth succeeds — and returns the
+// connection and framer to use for the subsequent relay phase.
+func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, authSecret *[]byte, connTracked *bool, tunnel **h2TunnelState, handover func(net.Conn) (net.Conn, *http2.Framer), ekm []byte) {
+	for {
+		conn := *connPtr
+		framer := *framerPtr
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		frame, err := framer.ReadFrame()
+		if err != nil {
+			if err != io.EOF {
+				logger.Debug("Frame read error: %v", err)
+			}
+			return
+		}
+		logger.Debug("Received frame: %T (stream=%d)", frame, frame.Header().StreamID)
+
+		switch f := frame.(type) {
+		case *http2.SettingsFrame:
+			if !f.IsAck() {
+				logger.Debug("Received SETTINGS, sending ACK")
+				framer.WriteSettingsAck()
+			}
+		case *http2.HeadersFrame:
+			wasAuthed := *authenticated
+			processH2HeadersFrame(conn, f, framer, hpackDec, srvCtx, logger, authenticated, authClientID, authSecret, connTracked, ekm)
+			// Auth just succeeded on this frame: perform the kTLS handover
+			// now, before reading any further frames. The auth ack has been
+			// written through the TLS stack and flushed; the client is parked
+			// in waitForServerAck, so no client bytes are in flight.
+			if !wasAuthed && *authenticated && handover != nil {
+				newConn, newFramer := handover(conn)
+				*connPtr = newConn
+				*framerPtr = newFramer
+			}
+		case *http2.DataFrame:
+			if !*authenticated {
+				logger.Debug("Received DATA before auth, ignoring")
+				continue
+			}
+			handleH2DataFrame(conn, f, framer, srvCtx, *tunnel, *authClientID, *authSecret, logger, tunnel)
+		case *http2.WindowUpdateFrame:
+			// Ignore
+		case *http2.PingFrame:
+			framer.WritePing(true, f.Data)
+		}
+	}
+}
+
+// processH2HeadersFrame extracts auth headers and, if valid, marks the connection authenticated.
+func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, authSecret *[]byte, connTracked *bool, ekm []byte) {
+	var apiKey, requestID string
+	hpackDec.SetEmitFunc(func(hf hpack.HeaderField) {
+		logger.Debug("  Header: %s = %s", hf.Name, truncate(hf.Value, 50))
+		switch hf.Name {
+		case "x-goog-api-key":
+			apiKey = hf.Value
+		case "x-goog-request-id":
+			requestID = hf.Value
+		}
+	})
+	hpackDec.Write(f.HeaderBlockFragment())
+
+	if apiKey == "" || requestID == "" {
+		return
+	}
+
+	ok, clientID, secret := verifyH2AuthMulti(srvCtx, apiKey, requestID, ekm, logger)
+	if !ok {
+		logger.Warn("HTTP/2 steganography auth FAILED")
+		return
+	}
+
+	*authenticated = true
+	*authClientID = clientID
+	*authSecret = secret
+	sendH2AuthAck(framer, f.StreamID, secret)
+
+	if !*connTracked && srvCtx.registry != nil && clientID.id != "" {
+		if err := srvCtx.registry.AddConnection(clientID.id, conn); err != nil {
+			logger.Warn("Failed to track H2 connection for client %s: %v", clientID, err)
+		} else {
+			*connTracked = true
+		}
+	}
+}
+
+// verifyH2AuthMulti checks per-client secrets then global secret for HTTP/2 stego auth.
+// Returns (ok, clientID, usedSecret).
+func verifyH2AuthMulti(srvCtx *serverContext, apiKey, requestID string, ekm []byte, logger *log.Logger) (bool, clientIdentity, []byte) {
+	if srvCtx.registry != nil {
+		for _, client := range srvCtx.registry.ListClients() {
+			if verifyH2Auth(apiKey, requestID, []byte(client.Secret), ekm) {
+				logger.Info("HTTP/2 steganography authenticated (client: %s, id: %s)", client.Name, client.ID)
+				return true, registryIdentity(client.ID), []byte(client.Secret)
+			}
+		}
+	}
+	if len(srvCtx.cfg.Secret) > 0 && verifyH2Auth(apiKey, requestID, srvCtx.cfg.Secret, ekm) {
+		logger.Info("HTTP/2 steganography authenticated (global secret)")
+		return true, sharedIdentity(globalClientID), srvCtx.cfg.Secret
+	}
+	return false, clientIdentity{}, nil
+}
+
+// handleH2DataFrame processes an authenticated HTTP/2 DATA frame.
+func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, srvCtx *serverContext, _ *h2TunnelState, authClientID clientIdentity, authSecret []byte, logger *log.Logger, tunnelPtr **h2TunnelState) {
+	data := f.Data()
+	logger.Debug("Received DATA: %d bytes", len(data))
+
+	// Keyed marker keeps the frame recognisable only to a peer holding the
+	// authenticated secret; a 1.10.x client's literal "TIRD" fails here.
+	off, ok := strategy.MatchStegoClientFrame(authSecret, data)
+	if !ok || len(data) < off+3 {
+		return
+	}
+
+	flags := data[off]
+	length := int(binary.BigEndian.Uint16(data[off+1 : off+3]))
+	logger.Debug("Stego frame: flags=%02x, length=%d", flags, length)
+
+	if length > len(data)-off-3 {
+		return
+	}
+
+	payload := data[off+3 : off+3+length]
+	if flags&0x01 != 0 {
+		paddingKey := deriveKey(authSecret, "padding-key")
+		for i := range payload {
+			payload[i] ^= paddingKey[i%len(paddingKey)]
+		}
+	}
+	logger.Debug("Extracted payload: %d bytes", len(payload))
+
+	tunnel := *tunnelPtr
+	if tunnel == nil {
+		t := &h2TunnelState{streamID: f.StreamID, clientID: authClientID, secret: authSecret, remoteAddr: originOf(conn.RemoteAddr())}
+		setupH2Tunnel(t, framer, payload, srvCtx, logger)
+		*tunnelPtr = t
+		return
+	}
+	if tunnel.targetConn == nil {
+		return
+	}
+
+	if _, ok := tunnel.targetConn.(*h2TunConn); ok {
+		forwardH2TUNPacket(tunnel, f.StreamID, payload, logger)
+	} else {
+		forwardH2ProxyData(conn, tunnel, payload, logger)
+	}
+}
+
+// forwardH2TUNPacket reassembles inbound TUN frames from stego payloads and writes
+// the contained IP packets to the shared TUN device.
+//
+// The stego stream is a byte stream carrying [len:4][pkt:N] frames. A single frame
+// can arrive split across several stego DATA-frame payloads: a relay forwards a
+// downstream client's packets over a non-tunMode upstream stego conn that caps
+// chunks at 1000/1400 bytes (writeViaPaddedData / writeViaData), so a 1404-byte
+// frame (1400-byte inner packet) is emitted as 2+ payloads. The previous version
+// treated each payload as one self-contained frame and dropped anything that did
+// not fit (int(pktLen) > len(payload)-4), black-holing every inner packet above
+// ~996 bytes on relay chains. We now buffer across payloads like the morph path.
+func forwardH2TUNPacket(tunnel *h2TunnelState, streamID uint32, payload []byte, logger *log.Logger) {
+	tunnel.streamID = streamID
+	if tunnel.sink == nil {
+		return
+	}
+
+	tunnel.reasmBuf = append(tunnel.reasmBuf, payload...)
+	tunnel.reasmBuf = reassembleH2TUNFrames(tunnel.reasmBuf,
+		func(ipPkt []byte) {
+			// Auto-MTU: reflect probe REQUESTs back over the stego channel instead
+			// of writing them to the TUN device. Reassembly above has already
+			// rebuilt the whole frame, so the marker check sees a complete probe.
+			if tun.IsProbeFrame(ipPkt) {
+				if reply := tun.MakeProbeReply(ipPkt); reply != nil {
+					if _, ok := tunnel.targetConn.(*h2TunConn); ok && tunnel.tunGate != nil {
+						frame := make([]byte, 4+len(reply))
+						binary.BigEndian.PutUint32(frame[:4], uint32(len(reply)))
+						copy(frame[4:], reply)
+						if err := tunnel.tunGate.Frame(frame); err != nil && !FrameDropped(err) {
+							logger.Debug("Auto-MTU: H2 probe reply write failed: %v", err)
+						}
+						logger.Debug("Auto-MTU: H2 echoed PROBE_REPLY size=%d", len(reply))
+					}
+					tunnel.sink.UpdateActivity()
+				}
+				return
+			}
+			logger.Debug("H2 TUN: forwarding %d bytes, first 20: %x", len(ipPkt), ipPkt[:minInt(20, len(ipPkt))])
+			if err := tunnel.sink.WritePacket(ipPkt); err != nil {
+				logger.Debug("H2 TUN sink write error: %v", err)
+			}
+			tunnel.sink.UpdateActivity()
+		},
+		func() {
+			// Keepalive (zero length) - echo back. The morph, confusion and native
+			// TUN handlers all echo zero-length keepalives; without it idle H2
+			// clients get no inbound traffic and self-disconnect when their
+			// readTimeout expires.
+			if _, ok := tunnel.targetConn.(*h2TunConn); ok && tunnel.tunGate != nil {
+				logger.Debug("H2 TUN: received keepalive, echoing back")
+				if err := tunnel.tunGate.Frame([]byte{0, 0, 0, 0}); err != nil && !FrameDropped(err) {
+					logger.Debug("H2 TUN: keepalive echo failed: %v", err)
+				}
+			}
+			tunnel.sink.UpdateActivity()
+		})
+}
+
+// reassembleH2TUNFrames extracts complete [len:4][pkt:N] frames from buf, calling
+// deliver(ipPkt) for each data packet and onKeepalive() for each zero-length frame.
+// It returns the unconsumed remainder (a partial frame awaiting more bytes). A bogus
+// length desyncs the stream, recovered by sliding one byte forward like the morph
+// reassembler. If the remainder exceeds h2ReasmBufLimit (a persistently desynced
+// stream) it is dropped and nil is returned, so the buffer cannot grow without bound
+// on the swap-0 node A box.
+func reassembleH2TUNFrames(buf []byte, deliver func(ipPkt []byte), onKeepalive func()) []byte {
+	for len(buf) >= 4 {
+		pktLen := binary.BigEndian.Uint32(buf[0:4])
+
+		if pktLen == 0 {
+			buf = buf[4:]
+			onKeepalive()
+			continue
+		}
+
+		if pktLen < 20 || pktLen > 65535 {
+			buf = buf[1:]
+			continue
+		}
+
+		totalLen := 4 + int(pktLen)
+		if len(buf) < totalLen {
+			break
+		}
+
+		deliver(buf[4:totalLen])
+		buf = buf[totalLen:]
+	}
+
+	if len(buf) > h2ReasmBufLimit {
+		log.Warn("H2 TUN reassembly buffer overflow (%d bytes), resetting", len(buf))
+		return nil
+	}
+	return buf
+}
+
+// forwardH2ProxyData forwards stego payload to the proxy target connection.
+func forwardH2ProxyData(conn net.Conn, tunnel *h2TunnelState, payload []byte, logger *log.Logger) {
+	if control.IsControlMessage(payload) {
+		control.HandleServerMessage(conn, payload)
+		return
+	}
+	tunnel.mu.Lock()
+	n, err := tunnel.targetConn.Write(payload)
+	tunnel.mu.Unlock()
+	if err != nil {
+		logger.Debug("Write to target failed: %v", err)
+	} else {
+		logger.Debug("Wrote %d bytes to target (first 20: %x)", n, payload[:minInt(20, len(payload))])
+	}
+}
+
+// handleMorphConnection handles Morph protocol connections
+// morphShaperReadTimeout bounds how long the server waits for the optional
+// wire-protocol v2 shaper-ID byte. v2 clients send it in the same TCP segment
+// as the auth token, so it is present immediately; pre-v2 clients never send
+// it and the read times out, yielding a noop shaper.
+const morphShaperReadTimeout = 2 * time.Second
+
+// readMorphShaperID reads the optional 1-byte shaper ID that trails the MRPH
+// auth token in wire-protocol v2. On timeout, EOF or an unknown ID it returns
+// a NoopShaper so the connection falls back to the legacy byte-relay framing.
+// The seed is drawn locally: it only affects this side's outbound packet
+// sizing, never Unwrap correctness (the frame layout is seed-independent).
+func readMorphShaperID(conn net.Conn, logger *log.Logger) shaper.Shaper {
+	idBuf := make([]byte, 1)
+	_ = conn.SetReadDeadline(time.Now().Add(morphShaperReadTimeout))
+	_, err := io.ReadFull(conn, idBuf)
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		// Old client (no ID byte) or slow link: stay on the legacy wire format.
+		logger.Debug("Morph shaper ID absent (%v); using noop", err)
+		return shaper.NoopShaper{}
+	}
+	id := presets.ShaperID(idBuf[0])
+	if id == presets.ShaperIDNoop {
+		return shaper.NoopShaper{}
+	}
+	sh, err := presets.ShaperByID(id, 0)
+	if err != nil {
+		logger.Warn("Morph: unknown shaper ID %d (%v); using noop", idBuf[0], err)
+		return shaper.NoopShaper{}
+	}
+	logger.Debug("Morph: negotiated shaper ID %d", idBuf[0])
+	return sh
+}
+
+// isMorphNoopShaper reports whether sh is the passthrough shaper. The legacy
+// byte-relay path stays bit-identical when this is true.
+func isMorphNoopShaper(sh shaper.Shaper) bool {
+	if sh == nil {
+		return true
+	}
+	switch sh.(type) {
+	case shaper.NoopShaper, *shaper.NoopShaper:
+		return true
+	}
+	return false
+}
+
+// writeMorphShapedFrames writes each shaper frame as one morph packet
+// [dataLen:4][paddingLen:2][frame:N], mirroring the client's writeShaped. The
+// shaper already padded each frame to its target size, so no extra morph
+// padding is added here (paddingLen=0); the client's readShaped reads the
+// whole frame and hands it to Unwrap, which strips the shaper's own padding.
+func writeMorphShapedFrames(conn net.Conn, sh shaper.Shaper, frames [][]byte) error {
+	for _, frame := range frames {
+		hdr := make([]byte, 6+len(frame))
+		binary.BigEndian.PutUint32(hdr[0:4], uint32(len(frame)))
+		// paddingLen stays 0: the shaper frame carries its own padding.
+		copy(hdr[6:], frame)
+		if _, err := conn.Write(hdr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
+	logger.Debug("Processing Morph connection")
+
+	// Session binding (S22): capture the TLS exporter before kTLS offload (which
+	// happens after auth, below). nil on the plaintext entry path — our clients
+	// always run over TLS, and verifyMorphAuth rejects every token when there is
+	// no exporter (sessionBindingOrUnmatchable).
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("Morph: exporter unavailable: %v", ekmErr)
+	}
+
+	// Read MRPH magic (4 bytes) + nameLen (1 byte)
+	mrphHeader := make([]byte, 5)
+	if _, err := io.ReadFull(conn, mrphHeader); err != nil {
+		logger.Debug("Failed to read MRPH header: %v", err)
+		return
+	}
+
+	if string(mrphHeader[0:4]) != "MRPH" {
+		logger.Debug("Invalid MRPH magic")
+		return
+	}
+
+	nameLen := int(mrphHeader[4])
+	var profileName []byte
+	if nameLen > 0 {
+		// Read profile name
+		profileName = make([]byte, nameLen)
+		if _, err := io.ReadFull(conn, profileName); err != nil {
+			logger.Debug("Failed to read profile name: %v", err)
+			return
+		}
+		logger.Debug("Morph profile: %s", string(profileName))
+	}
+
+	// Read auth token (32 bytes HMAC-SHA256)
+	authToken := make([]byte, 32)
+	if _, err := io.ReadFull(conn, authToken); err != nil {
+		logger.Debug("Failed to read auth token: %v", err)
+		return
+	}
+
+	// Verify auth token against per-client secrets and global secret
+	authenticated := false
+	var usedSecret []byte
+	var clientID clientIdentity // For IP pool allocation
+
+	// 1. Try per-client secrets from Redis (if registry exists)
+	if srvCtx.registry != nil {
+		clients := srvCtx.registry.ListClients()
+		logger.Debug("Traffic Morph: checking %d clients from registry", len(clients))
+		for _, client := range clients {
+			secretBytes := []byte(client.Secret)
+			logger.Debug("Traffic Morph: trying client '%s' (secret len=%d)", client.Name, len(client.Secret))
+			if verifyMorphAuth(authToken, secretBytes, ekm) {
+				logger.Info("Traffic Morph authenticated (client: %s, id: %s)", client.Name, client.ID)
+				authenticated = true
+				usedSecret = secretBytes
+				clientID = registryIdentity(client.ID)
+				break
+			}
+		}
+	} else {
+		logger.Debug("Traffic Morph: no registry available")
+	}
+
+	// 2. Fallback to global secret (if not found in registry and global secret exists)
+	if !authenticated && len(srvCtx.cfg.Secret) > 0 {
+		if verifyMorphAuth(authToken, srvCtx.cfg.Secret, ekm) {
+			logger.Info("Traffic Morph authenticated (global secret)")
+			authenticated = true
+			usedSecret = srvCtx.cfg.Secret
+			clientID = sharedIdentity(globalClientID) // every client on the shared secret lands here
+		}
+	}
+
+	if !authenticated {
+		logger.Warn("Traffic Morph authentication FAILED")
+		conn.Write([]byte{0x01}) // best-effort fail ack; client treats as fail and closes
+		return
+	}
+
+	_ = usedSecret // Mark as used
+
+	// Wire-protocol v2: a 1-byte shaper ID trails the auth token in the same
+	// handshake write. v2 clients always send it; pre-v2 clients send nothing
+	// more until they read the ack, so a short read deadline distinguishes the
+	// two without a version negotiation. Timeout / EOF => ID 0 (noop), keeping
+	// the legacy wire format for old clients.
+	morphShaper := readMorphShaperID(conn, logger)
+
+	// Track per-client connection for metrics. Use a closure on the conn
+	// variable so the defer picks up the kTLS-wrapped value if we hand
+	// the socket over later via ktls.TryEnable + registry.SwapConn.
+	if srvCtx.registry != nil && clientID.id != "" {
+		if err := srvCtx.registry.AddConnection(clientID.id, conn); err != nil {
+			logger.Warn("Failed to track connection for client %s: %v", clientID, err)
+		} else {
+			defer func() {
+				srvCtx.registry.RemoveConnection(clientID.id, conn)
+			}()
+		}
+	}
+
+	// Auth complete — write 1-byte ack to client (Phase 2 wire protocol).
+	// 0x00 = auth ok, dialing target next. The client must read this byte
+	// before sending the first morph frame, so it can ktls.TryEnable on
+	// the matching boundary.
+	if _, err := conn.Write([]byte{0x00}); err != nil {
+		logger.Warn("Failed to write morph auth ack: %v", err)
+		return
+	}
+
+	// Auth phase complete: hand the socket over to kTLS for the relay
+	// phase. We have read MRPH+name+auth to completion and the ack write
+	// flushed synchronously to the kernel send buffer. Subsequent morph
+	// frame reads (target addr) and writes (relay data) go through kTLS.
+	preSwap := conn
+	conn = ktls.TryEnable(conn, "tired-morph")
+	if conn != preSwap && srvCtx.registry != nil && clientID.id != "" {
+		// Replace the stored *tls.Conn with the live *ktls.Conn so
+		// forced-disconnect Close() targets the right socket wrapper.
+		srvCtx.registry.SwapConn(clientID.id, preSwap, conn)
+	}
+
+	// Read first morph packet containing target address
+	// Morph packet format: [dataLen:4][paddingLen:2][data:N][padding:M]
+	morphHdr := make([]byte, 6)
+	if _, err := io.ReadFull(conn, morphHdr); err != nil {
+		logger.Debug("Failed to read morph packet header: %v", err)
+		return
+	}
+
+	dataLen := int(morphHdr[0])<<24 | int(morphHdr[1])<<16 | int(morphHdr[2])<<8 | int(morphHdr[3])
+	paddingLen := int(morphHdr[4])<<8 | int(morphHdr[5])
+
+	if dataLen == 0 {
+		// Dummy packet, skip padding and read next
+		logger.Debug("Received dummy packet, reading next")
+		if paddingLen > 0 {
+			discard := make([]byte, paddingLen)
+			io.ReadFull(conn, discard)
+		}
+		// Try again
+		if _, err := io.ReadFull(conn, morphHdr); err != nil {
+			return
+		}
+		dataLen = int(morphHdr[0])<<24 | int(morphHdr[1])<<16 | int(morphHdr[2])<<8 | int(morphHdr[3])
+		paddingLen = int(morphHdr[4])<<8 | int(morphHdr[5])
+	}
+
+	// With a shaper active the address payload is wrapped (len-prefixed +
+	// zero-padded up to the preset's packet size), so the wire dataLen can be
+	// up to MTU rather than the tight [2,256] the legacy address frame uses.
+	// Validate the unwrapped length below instead.
+	noopShaper := isMorphNoopShaper(morphShaper)
+	maxFirstFrame := 256
+	if !noopShaper {
+		maxFirstFrame = 1500
+	}
+	if dataLen > maxFirstFrame || dataLen < 2 {
+		logger.Debug("Invalid morph data length: %d", dataLen)
+		return
+	}
+
+	// Read the data (which contains our 2-byte length + address)
+	morphData := make([]byte, dataLen)
+	if _, err := io.ReadFull(conn, morphData); err != nil {
+		logger.Debug("Failed to read morph data: %v", err)
+		return
+	}
+
+	// Discard padding
+	if paddingLen > 0 {
+		discard := make([]byte, paddingLen)
+		io.ReadFull(conn, discard)
+	}
+
+	// Unwrap the shaper framing to recover the original address payload. For
+	// NoopShaper this is identity, so the legacy path is byte-unchanged.
+	if !noopShaper {
+		morphData = morphShaper.Unwrap([][]byte{morphData})
+		if len(morphData) < 2 {
+			logger.Debug("Morph data too short after unwrap: %d", len(morphData))
+			return
+		}
+	}
+
+	// Parse target address from morph data
+	// Client sends: [mode:1][...] where mode=0x02 is TUN, otherwise [addrLen:2][address:N]
+	logger.Debug("Morph data: len=%d, first 10 bytes=%x", len(morphData), morphData[:minInt(10, len(morphData))])
+	if len(morphData) < 2 {
+		logger.Debug("Morph data too short")
+		return
+	}
+
+	// Check for TUN mode (first byte = 0x02)
+	if morphData[0] == 0x02 {
+		// The TUN relay path (SharedTUN dispatcher + morphPacketWriter) does
+		// not yet apply shaper Wrap/Unwrap, so a negotiated shaper would
+		// corrupt the stream. Refuse loudly rather than relay garbage; the
+		// addr-relay path below fully supports shapers.
+		if !noopShaper {
+			logger.Warn("Morph TUN mode with non-noop shaper is unsupported; closing")
+			failPacket := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01}
+			conn.Write(failPacket)
+			return
+		}
+		logger.Info("Morph TUN mode detected")
+		handleMorphTUNMode(conn, morphData[1:], srvCtx, logger, clientID)
+		return
+	}
+
+	addrLen := int(morphData[0])<<8 | int(morphData[1])
+	if addrLen > len(morphData)-2 || addrLen < 3 {
+		logger.Debug("Invalid address length in morph data: %d (morphData len=%d)", addrLen, len(morphData))
+		return
+	}
+	targetAddr := string(morphData[2 : 2+addrLen])
+
+	logger.Info("Morph tunnel to: %s", targetAddr)
+
+	// Connect to target (via upstream if configured)
+	var targetConn net.Conn
+	var err error
+	if srvCtx.upstreamDialer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		cancel()
+	} else {
+		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
+	}
+	if err != nil {
+		logger.Warn("Failed to connect to %s: %v", targetAddr, err)
+		// Send failure via morph packet: [dataLen:4][paddingLen:2][data:1]
+		failPacket := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01}
+		conn.Write(failPacket)
+		return
+	}
+	defer targetConn.Close()
+
+	// Send success via morph packet: [dataLen:4][paddingLen:2][data:1]
+	successPacket := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}
+	conn.Write(successPacket)
+	logger.Debug("Connected to target, starting morph relay")
+
+	// Relay with morph framing
+	var wg sync.WaitGroup
+	var bytesUp, bytesDown int64
+
+	wg.Add(2)
+
+	// Client -> Target (need to unwrap morph packets)
+	go func() {
+		defer wg.Done()
+		for {
+			// Read morph packet header: [dataLen:4][paddingLen:2]
+			hdr := make([]byte, 6)
+			if _, err := io.ReadFull(conn, hdr); err != nil {
+				return
+			}
+			pktLen := int(hdr[0])<<24 | int(hdr[1])<<16 | int(hdr[2])<<8 | int(hdr[3])
+			padLen := int(hdr[4])<<8 | int(hdr[5])
+
+			if pktLen == 0 {
+				// Dummy packet, discard padding
+				if padLen > 0 {
+					discard := make([]byte, padLen)
+					io.ReadFull(conn, discard)
+				}
+				continue
+			}
+			if pktLen > 65536 { // Must match client buffer (32KB + padding)
+				return
+			}
+			data := make([]byte, pktLen)
+			if _, err := io.ReadFull(conn, data); err != nil {
+				return
+			}
+			// Discard padding
+			if padLen > 0 {
+				discard := make([]byte, padLen)
+				io.ReadFull(conn, discard)
+			}
+
+			// Strip shaper framing to recover the original payload. NoopShaper
+			// is identity here, preserving the legacy wire format exactly.
+			if !noopShaper {
+				data = morphShaper.Unwrap([][]byte{data})
+				if len(data) == 0 {
+					continue
+				}
+			}
+
+			// Check for control message
+			if control.IsControlMessage(data) {
+				control.HandleServerMessage(conn, data)
+				continue
+			}
+
+			n, err := targetConn.Write(data)
+			atomic.AddInt64(&bytesUp, int64(n))
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Target -> Client (wrap in morph packets)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 1400)
+		for {
+			n, err := targetConn.Read(buf)
+			if err != nil {
+				return
+			}
+
+			if !noopShaper {
+				// Shaper path: fragment+pad the payload into shaper frames,
+				// then wrap each frame in the morph header. This mirrors the
+				// client's writeShaped so its readShaped/Unwrap reconstructs
+				// the bytes. Downstream sizing uses this side's own RNG; only
+				// the frame layout has to match, which it does by construction.
+				frames := morphShaper.Wrap(buf[:n])
+				werr := writeMorphShapedFrames(conn, morphShaper, frames)
+				morphShaper.Release(frames)
+				atomic.AddInt64(&bytesDown, int64(n))
+				if werr != nil {
+					return
+				}
+				continue
+			}
+
+			// Wrap in morph packet: [dataLen:4][paddingLen:2][data:n][padding:M]
+			padLen := 30 // Simple fixed padding
+			packet := make([]byte, 6+n+padLen)
+			// Data length
+			packet[0] = byte(n >> 24)
+			packet[1] = byte(n >> 16)
+			packet[2] = byte(n >> 8)
+			packet[3] = byte(n)
+			// Padding length
+			packet[4] = byte(padLen >> 8)
+			packet[5] = byte(padLen)
+			// Data
+			copy(packet[6:], buf[:n])
+			// Random padding
+			if _, err := rand.Read(packet[6+n:]); err != nil {
+				return
+			}
+
+			_, err = conn.Write(packet)
+			atomic.AddInt64(&bytesDown, int64(n))
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	logger.Info("Morph tunnel closed (up=%d, down=%d)", bytesUp, bytesDown)
+
+	// Update metrics
+	if srvCtx.metrics != nil {
+		srvCtx.metrics.AddBytes(bytesUp, bytesDown)
+	}
+
+	// Update per-client metrics
+	if srvCtx.registry != nil && clientID.id != "" {
+		srvCtx.registry.AddBytes(clientID.id, bytesUp, bytesDown)
+	}
+}
+
+// fillRandPadding fills b with non-cryptographic random bytes. These bytes are
+// frame padding that only varies packet sizes for DPI evasion; the peer
+// discards them by length and never inspects their content. A fast PRNG is
+// therefore sufficient and, unlike crypto/rand, cannot fail - so it must never
+// panic and tear down the data plane. This mirrors the client side, which
+// already fills morph padding with a fast RNG.
+func fillRandPadding(b []byte) {
+	for i := 0; i < len(b); i += 8 {
+		v := mrand.Uint64()
+		for j := 0; j < 8 && i+j < len(b); j++ {
+			b[i+j] = byte(v >> (8 * j))
+		}
+	}
+}
+
+// morphFramePacket creates Morph-framed packet for TUN->Client
+// Format: [dataLen:4][paddingLen:2][len:4][packet:N][padding]
+func morphFramePacket(pkt []byte) []byte {
+	innerLen := 4 + len(pkt)
+	padLen := 30
+	totalLen := 6 + innerLen + padLen
+
+	framed := make([]byte, totalLen)
+	binary.BigEndian.PutUint32(framed[0:4], uint32(innerLen))
+	binary.BigEndian.PutUint16(framed[4:6], uint16(padLen))
+	binary.BigEndian.PutUint32(framed[6:10], uint32(len(pkt)))
+	copy(framed[10:], pkt)
+	fillRandPadding(framed[10+len(pkt):])
+	return framed
+}
+
+// handleMorphTUNMode handles TUN mode over Morph protocol
+func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverContext, logger *log.Logger, clientID clientIdentity) {
+	cfg := srvCtx.cfg
+	logger.Debug("Processing Morph TUN mode, remaining data: %d bytes, hex=%x", len(remainingData), remainingData)
+
+	// Track per-client connection for metrics
+	if srvCtx.registry != nil && clientID.id != "" {
+		if err := srvCtx.registry.AddConnection(clientID.id, conn); err != nil {
+			logger.Warn("Failed to track connection for client %s: %v", clientID, err)
+		} else {
+			defer srvCtx.registry.RemoveConnection(clientID.id, conn)
+		}
+	}
+
+	// Parse TUN handshake from remaining data: [localIP:4][mtu:2][version:1]
+	// Version byte is optional (v1 clients send 6 bytes, v2 clients send 7 bytes)
+	if len(remainingData) < 6 {
+		logger.Debug("Morph TUN handshake too short: %d bytes", len(remainingData))
+		failPacket := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01}
+		conn.Write(failPacket)
+		return
+	}
+
+	// A relay forwards this client upstream and never touches its own TUN, so
+	// only an exit needs the shared device here.
+	if srvCtx == nil || (srvCtx.sharedTUN == nil && srvCtx.upstreamDialer == nil) {
+		logger.Error("Shared TUN not initialized")
+		failPacket := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01}
+		conn.Write(failPacket)
+		return
+	}
+
+	requestedIP := net.IP(remainingData[0:4])
+
+	// Check for version byte (v2 clients send 7 bytes total)
+	var clientVersion uint8 = 1 // Default to v1 for backwards compatibility
+	if len(remainingData) >= 7 {
+		clientVersion = remainingData[6]
+		logger.Debug("Morph TUN client requested: IP=%s, version=%d", requestedIP, clientVersion)
+	} else {
+		logger.Debug("Morph TUN client requested: IP=%s (legacy v1)", requestedIP)
+	}
+
+	// One gate for every downstream write on this tunnel: the handshake
+	// response, the dispatcher's frames, the keepalive echo, the relay pump.
+	gate := newTunFrameGate(func(framed []byte) error {
+		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		_, err := conn.Write(framed)
+		return err
+	})
+	writeMorphFrame := func(framed []byte) error {
+		err := gate.Frame(framed)
+		if FrameDropped(err) {
+			return nil
+		}
+		return err
+	}
+
+	var clientIP, serverIP net.IP
+	var sink tunPacketSink
+
+	if srvCtx.upstreamDialer != nil {
+		// Relay: hand this client to the upstream exit instead of terminating it
+		// here, so a client that fell back to morph still exits where it asked.
+		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData,
+			originOf(conn.RemoteAddr()), func(pkt []byte) error {
+				return writeMorphFrame(morphFramePacket(pkt))
+			})
+		if err != nil {
+			logger.Warn("Morph TUN relay: upstream dial failed: %v", err)
+			failPacket := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01}
+			conn.Write(failPacket)
+			return
+		}
+		sink, serverIP, clientIP = relaySink, upServerIP, upClientIP
+		defer func() {
+			relaySink.Close()
+			logger.Info("Morph TUN relay client disconnected: %s (clientID=%s)", clientIP, clientID)
+		}()
+	} else {
+		// Allocate IP from pool (if available) or use requested IP as fallback
+		if srvCtx.ipPool != nil {
+			allocatedIP, err := srvCtx.ipPool.Allocate(allocationKey(clientID, originOf(conn.RemoteAddr())), requestedIP, "")
+			if err != nil {
+				logger.Error("Failed to allocate IP from pool: %v", err)
+				failPacket := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01}
+				conn.Write(failPacket)
+				return
+			}
+			clientIP = allocatedIP
+			logger.Info("Morph TUN client: allocated IP=%s from pool (requested=%s, clientID=%s)", clientIP, requestedIP, clientID)
+		} else {
+			clientIP = requestedIP
+			logger.Info("Morph TUN client: IP=%s (no pool)", clientIP)
+		}
+		serverIP = cfg.TunIP
+
+		// Register client with shared TUN using Morph framing
+		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, conn, morphFramePacket, gate)
+		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
+		sink = localSink
+		defer func() {
+			localSink.Close()
+			logger.Info("Morph TUN client disconnected: %s (clientID=%s)", clientIP, clientID)
+		}()
+	}
+
+	// Send success response via morph packet: [dataLen:4][paddingLen:2][payload][padding]
+	// Local exit: v6 addrs from our pool. Relay: v6 addrs assigned by the
+	// upstream exit (absent when the exit did not negotiate dual-stack).
+	dual := downstreamDualStackAddrs(sink, cfg.IPPoolV6, clientIP)
+	respData := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual)
+	recordDualStackSession(srvCtx, clientVersion, dual)
+
+	padLen := 30
+	resp := make([]byte, 6+len(respData)+padLen)
+	binary.BigEndian.PutUint32(resp[0:4], uint32(len(respData)))
+	binary.BigEndian.PutUint16(resp[4:6], uint16(padLen))
+	copy(resp[6:], respData)
+	fillRandPadding(resp[6+len(respData):])
+	if err := gate.Open(resp); err != nil {
+		logger.Debug("Morph TUN handshake response write failed: %v", err)
+		return
+	}
+
+	logger.Info("Morph TUN mode established (client=%s, server=%s)", clientIP, serverIP)
+
+	// Main loop: Morph -> sink (server-bound traffic)
+	// sink -> Client is handled by SharedTUN's dispatcher (exit) or the relay pump.
+	var packetsUp int64
+	var reassemblyBuf []byte
+
+	for {
+		select {
+		case <-sink.Done():
+			logger.Debug("Morph TUN loop stopping (client replaced or upstream gone)")
+			return
+		default:
+		}
+
+		// Read morph packet header: [dataLen:4][paddingLen:2]
+		hdr := make([]byte, 6)
+		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		if _, err := io.ReadFull(conn, hdr); err != nil {
+			logger.Debug("Morph TUN read header error: %v", err)
+			return
+		}
+
+		dataLen := int(hdr[0])<<24 | int(hdr[1])<<16 | int(hdr[2])<<8 | int(hdr[3])
+		paddingLen := int(hdr[4])<<8 | int(hdr[5])
+
+		// Handle dummy/keepalive packets - echo back
+		if dataLen == 0 {
+			if paddingLen > 0 {
+				discard := make([]byte, paddingLen)
+				io.ReadFull(conn, discard)
+			}
+			logger.Debug("Morph TUN: received keepalive, echoing back")
+			writeMorphFrame([]byte{0, 0, 0, 0, 0, 0})
+			sink.UpdateActivity()
+			continue
+		}
+
+		if dataLen > 65535 {
+			logger.Debug("Invalid morph TUN packet length: %d", dataLen)
+			continue
+		}
+
+		// Read packet data fragment
+		pktData := make([]byte, dataLen)
+		if _, err := io.ReadFull(conn, pktData); err != nil {
+			logger.Debug("Morph TUN read data error: %v", err)
+			return
+		}
+
+		// Discard padding
+		if paddingLen > 0 {
+			discard := make([]byte, paddingLen)
+			io.ReadFull(conn, discard)
+		}
+
+		// Add to reassembly buffer
+		reassemblyBuf = append(reassemblyBuf, pktData...)
+
+		// Try to extract complete packets from buffer: [len:4][IP_packet:N]
+		for len(reassemblyBuf) >= 4 {
+			pktLen := binary.BigEndian.Uint32(reassemblyBuf[0:4])
+			if pktLen > 65535 || pktLen < 20 {
+				logger.Debug("Invalid IP packet length in morph buffer: %d", pktLen)
+				reassemblyBuf = reassemblyBuf[1:]
+				continue
+			}
+
+			totalLen := 4 + int(pktLen)
+			if len(reassemblyBuf) < totalLen {
+				break
+			}
+
+			ipPkt := reassemblyBuf[4:totalLen]
+			reassemblyBuf = reassemblyBuf[totalLen:]
+
+			pktUp := atomic.AddInt64(&packetsUp, 1)
+			if pktUp%100 == 0 {
+				sink.UpdateActivity()
+			}
+			logger.Debug("Morph->sink: forwarding %d bytes", len(ipPkt))
+
+			if err := sink.WritePacket(ipPkt); err != nil {
+				logger.Debug("Morph TUN sink write error: %v", err)
+			}
+		}
+
+		// Prevent buffer from growing too large
+		if len(reassemblyBuf) > 128*1024 {
+			logger.Warn("Morph reassembly buffer overflow, resetting")
+			reassemblyBuf = nil
+		}
+	}
+}
+
+// morphPacketWriter wraps morph framing for NAT responses
+type morphPacketWriter struct {
+	conn net.Conn
+	mu   sync.Mutex
+}
+
+func (m *morphPacketWriter) Write(p []byte) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Wrap in morph packet: [dataLen:4][paddingLen:2][data:N][padding:M]
+	padLen := 30
+	packet := make([]byte, 6+len(p)+padLen)
+	binary.BigEndian.PutUint32(packet[0:4], uint32(len(p)))
+	binary.BigEndian.PutUint16(packet[4:6], uint16(padLen))
+	copy(packet[6:], p)
+	rand.Read(packet[6+len(p):])
+
+	_, err := m.conn.Write(packet)
+	return len(p), err
+}
+
+func (m *morphPacketWriter) Read(p []byte) (int, error) {
+	return 0, io.EOF // Not used for writing
+}
+
+func (m *morphPacketWriter) Close() error {
+	return m.conn.Close()
+}
+
+func (m *morphPacketWriter) LocalAddr() net.Addr {
+	return m.conn.LocalAddr()
+}
+
+func (m *morphPacketWriter) RemoteAddr() net.Addr {
+	return m.conn.RemoteAddr()
+}
+
+func (m *morphPacketWriter) SetDeadline(t time.Time) error {
+	return m.conn.SetDeadline(t)
+}
+
+func (m *morphPacketWriter) SetReadDeadline(t time.Time) error {
+	return m.conn.SetReadDeadline(t)
+}
+
+func (m *morphPacketWriter) SetWriteDeadline(t time.Time) error {
+	return m.conn.SetWriteDeadline(t)
+}
+
+// handleHTTP1 handles HTTP/1.x connections
+func handleHTTP1(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
+	cfg := srvCtx.cfg
+	logger.Debug("Processing HTTP/1.x connection")
+
+	// Read full request
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		logger.Debug("Failed to read HTTP request: %v", err)
+		return
+	}
+
+	request := string(buf[:n])
+	logger.Debug("HTTP request: %s", truncate(request, 100))
+
+	// Check for HTTP Polling (meek-style) - POST with X-Session-ID header
+	if bytes.HasPrefix(buf[:n], []byte("POST ")) && bytes.Contains(buf[:n], []byte("X-Session-ID:")) {
+		logger.Debug("HTTP Polling request detected")
+		handleHTTPPolling(conn, srvCtx, buf[:n], logger)
+		return
+	}
+
+	// Check for WebSocket upgrade
+	if bytes.Contains(buf[:n], []byte("Upgrade: websocket")) {
+		logger.Debug("WebSocket upgrade requested")
+		handleWebSocket(conn, srvCtx, logger)
+		return
+	}
+
+	// Check for protocol confusion in body
+	if idx := bytes.Index(buf[:n], []byte("TIRED")); idx > 0 {
+		logger.Debug("Found confusion magic at offset %d", idx)
+		// Extract real data after magic
+		handleConfusionData(conn, buf[idx:n], srvCtx, logger)
+		return
+	}
+
+	// Serve fake response. We already drained the client's request into buf[:n]
+	// above; serveFakeWebsite starts a fresh http.ReadRequest, so without
+	// replaying those bytes it blocks on an empty socket until the 75s
+	// keep-alive timeout — the client gets 0 bytes and the silent hang
+	// fingerprints the box as non-nginx to DPI (issue #50). Replay the consumed
+	// request so the fake nginx answers immediately, exactly like a real server.
+	replay := &bufferedConn{
+		Conn:   conn,
+		reader: io.MultiReader(bytes.NewReader(buf[:n]), conn),
+	}
+	serveFakeHTTPResponse(replay, cfg, logger)
+}
+
+// handleWebSocket handles WebSocket connections
+func handleWebSocket(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
+	// Send WebSocket upgrade response
+	response := "HTTP/1.1 101 Switching Protocols\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Accept: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+		"\r\n"
+
+	if _, err := conn.Write([]byte(response)); err != nil {
+		logger.Debug("Failed to send WebSocket upgrade: %v", err)
+		return
+	}
+
+	logger.Info("WebSocket connection established")
+
+	// Read WebSocket frames
+	for {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+
+		// Read frame header
+		header := make([]byte, 2)
+		if _, err := io.ReadFull(conn, header); err != nil {
+			logger.Debug("WebSocket read error: %v", err)
+			return
+		}
+
+		fin := header[0]&0x80 != 0
+		opcode := header[0] & 0x0F
+		masked := header[1]&0x80 != 0
+		payloadLen := int(header[1] & 0x7F)
+
+		logger.Debug("WebSocket frame: fin=%v, opcode=%d, masked=%v, len=%d",
+			fin, opcode, masked, payloadLen)
+
+		// Handle extended payload length
+		switch payloadLen {
+		case 126:
+			extLen := make([]byte, 2)
+			io.ReadFull(conn, extLen)
+			payloadLen = int(binary.BigEndian.Uint16(extLen))
+		case 127:
+			extLen := make([]byte, 8)
+			io.ReadFull(conn, extLen)
+			payloadLen = int(binary.BigEndian.Uint64(extLen))
+		}
+
+		// Read mask key
+		var maskKey []byte
+		if masked {
+			maskKey = make([]byte, 4)
+			io.ReadFull(conn, maskKey)
+		}
+
+		// Read payload
+		payload := make([]byte, payloadLen)
+		if _, err := io.ReadFull(conn, payload); err != nil {
+			logger.Debug("Failed to read WebSocket payload: %v", err)
+			return
+		}
+
+		// Unmask payload
+		if masked {
+			for i := range payload {
+				payload[i] ^= maskKey[i%4]
+			}
+		}
+
+		logger.Debug("WebSocket payload: %d bytes", len(payload))
+
+		// Close frame
+		if opcode == 8 {
+			logger.Debug("WebSocket close received")
+			return
+		}
+
+		// Handle tunnel data in payload - use raw tunnel
+		if len(payload) > 0 {
+			// Create a buffered conn with the payload as initial data
+			wsConn := &bufferedConn{
+				Conn:   conn,
+				reader: io.MultiReader(bytes.NewReader(payload), conn),
+			}
+			handleRawTunnel(wsConn, srvCtx, logger, clientIdentity{})
+			return
+		}
+	}
+}
+
+// handleAntiProbeDispatch handles anti-probe connections that arrive over the
+// 1-byte protocol dispatch (TypeAntiProbe), after the TLS handshake. The
+// dispatch byte has already been consumed by handleTLSConnection, so the next
+// bytes are the timing-knock packets. Peek the first packet to resolve which
+// per-client (or global) secret the knock was built from, then hand off to the
+// shared knock verifier.
+func handleAntiProbeDispatch(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
+	cfg := srvCtx.cfg
+
+	// Peek the head of the first knock packet so detectTimingKnockWithRegistry
+	// can match a secret against its keyed tag. The tag sits at a fixed offset
+	// (header + tag = KnockHeaderLen+KnockTagLen bytes), so reading that many is
+	// enough to pick the secret without knowing the secret-dependent packet
+	// length yet. The buffer is generous enough to hold the whole first packet
+	// (<= knockSizeMin+span) when it arrives in one read; verifyFullKnockSequence
+	// reads the rest from the replayed stream.
+	// Pull the TLS exporter before wrapping the conn: the server proof written
+	// after the knock ACK is an HMAC over this keying material, which binds it
+	// to this exact handshake (see strategy.AntiProbeServerProof). conn is the
+	// raw *tls.Conn here, so there is nothing to unwrap yet.
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("Anti-probe dispatch: exporter unavailable: %v", ekmErr)
+		serveFakeWebsite(conn, cfg, logger)
+		return
+	}
+
+	peekBuf := make([]byte, 160)
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	n, err := io.ReadAtLeast(conn, peekBuf, strategy.KnockHeaderLen+strategy.KnockTagLen)
+	if err != nil {
+		logger.Debug("Anti-probe dispatch: failed to peek knock: %v (read %d)", err, n)
+		serveFakeWebsite(conn, cfg, logger)
+		return
+	}
+	conn.SetReadDeadline(time.Time{})
+	peekBuf = peekBuf[:n]
+
+	matched, secret, clientID := detectTimingKnockWithRegistry(peekBuf, srvCtx)
+	if !matched {
+		logger.Debug("Anti-probe dispatch: knock did not match any secret")
+		serveFakeWebsite(conn, cfg, logger)
+		return
+	}
+
+	// Replay the peeked bytes so verifyFullKnockSequence sees the full knock.
+	buffConn := &bufferedConn{
+		Conn:   conn,
+		reader: io.MultiReader(bytes.NewReader(peekBuf), conn),
+	}
+	handleAntiProbeAuth(buffConn, srvCtx, secret, clientID, ekm, logger)
+}
+
+// exporterBindingKey pulls the RFC 8446 §7.5 exporter out of a TLS connection,
+// looking through every bufferedConn the detector paths wrap it in. bufferedConn
+// embeds net.Conn, so ConnectionState is not promoted through it; the legacy TLS
+// path stacks two of them (replayed dispatch byte, then the protocol peek), so
+// peeling a single layer is not enough. A conn with no TLS layer underneath is
+// still an error.
+func exporterBindingKey(conn net.Conn) ([]byte, error) {
+	state, ok := tlsConnectionState(conn)
+	if !ok {
+		return nil, errors.New("connection is not TLS")
+	}
+	return customtls.ExportBindingKey(&state)
+}
+
+// handleAntiProbeAuth handles anti-probe authenticated connections
+func handleAntiProbeAuth(conn net.Conn, srvCtx *serverContext, secret []byte, clientID clientIdentity, ekm []byte, logger *log.Logger) {
+	cfg := srvCtx.cfg
+	logger.Debug("Processing anti-probe authentication (client: %s)", clientID)
+
+	// Verify knock sequence with the matched secret
+	if !verifyFullKnockSequence(conn, secret, srvCtx, logger) {
+		logger.Warn("Knock sequence verification failed")
+		serveFakeWebsite(conn, cfg, logger)
+		return
+	}
+
+	// Send ACK, then prove to the client that we hold the secret over this exact
+	// TLS session. The client waits for both bytes in Phase 3/4; without the
+	// proof a MITM answering 0x01 would pass, since InsecureSkipVerify trusts no
+	// certificate.
+	conn.Write([]byte{0x01})
+	proof := strategy.AntiProbeServerProof(secret, ekm)
+	if _, err := conn.Write(proof[:]); err != nil {
+		logger.Debug("Anti-probe: server proof write failed: %v", err)
+		return
+	}
+	logger.Info("Anti-probe authenticated (client: %s)", clientID)
+
+	// Now expect TLS handshake with auth token
+	// For simplicity, just start raw tunnel mode
+	handleRawTunnel(conn, srvCtx, logger, clientID)
+}
+
+// handleConfusionDispatch is the entry from the encrypted 1-byte discriminator,
+// which arrives with no peek of its own. It authenticates the same way the two
+// detector-driven entries do and falls back to the fake website, so choosing the
+// discriminator buys a peer nothing.
+func handleConfusionDispatch(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
+	sess, consumed, ok := classifyConfusion(conn, nil, srvCtx, logger)
+	if !ok {
+		replay := conn
+		if len(consumed) > 0 {
+			replay = &bufferedConn{
+				Conn:   conn,
+				reader: io.MultiReader(bytes.NewReader(consumed), conn),
+			}
+		}
+		serveFakeWebsite(replay, srvCtx.cfg, logger)
+		return
+	}
+	handleProtocolConfusion(sess, srvCtx, logger)
+}
+
+// handleProtocolConfusion serves an authenticated confusion connection.
+//
+// It is reached only through classifyConfusion, so by the time the first byte of
+// this function runs the peer has proved it holds a secret this server knows,
+// the record layer is keyed to that secret and a fresh per-connection nonce, and
+// nothing has been written back. The target address is read out of a sealed
+// frame rather than off the wire, which is the difference between "a peer asked
+// us to dial this" and "anyone can make us dial anything".
+func handleProtocolConfusion(sess *confusionSession, srvCtx *serverContext, logger *log.Logger) {
+	conn := sess.conn
+	logger.Debug("Processing protocol confusion (client: %s)", sess.clientID)
+
+	// First sealed frame: the mode byte and what follows it.
+	sess.raw.SetReadDeadline(time.Now().Add(confusionAuthTimeout))
+	first, err := conn.ReadFrame()
+	sess.raw.SetReadDeadline(time.Time{})
+	if err != nil {
+		logger.Debug("Confusion: first frame read failed: %v", err)
+		return
+	}
+	if len(first) == 0 {
+		logger.Debug("Confusion: empty first frame")
+		return
+	}
+
+	// TUN mode
+	if first[0] == 0x02 {
+		logger.Info("Confusion TUN mode detected (client: %s)", sess.clientID)
+		handleConfusionTUNMode(sess, first[1:], srvCtx, logger)
+		return
+	}
+
+	if len(first) < 2 {
+		logger.Debug("Confusion: truncated target address")
+		return
+	}
+	addrLen := int(first[0])<<8 | int(first[1])
+	if addrLen > 256 || addrLen < 3 || 2+addrLen > len(first) {
+		logger.Debug("Invalid embedded address length: %d", addrLen)
+		return
+	}
+	targetAddr := string(first[2 : 2+addrLen])
+	logger.Info("Confusion tunnel to: %s (client: %s)", targetAddr, sess.clientID)
+
+	// Connect to target (via upstream if configured)
+	var targetConn net.Conn
+	if srvCtx.upstreamDialer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		cancel()
+	} else {
+		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
+	}
+	if err != nil {
+		logger.Warn("Failed to connect to %s: %v", targetAddr, err)
+		conn.Write([]byte{0x01}) // Send failure
+		return
+	}
+	defer targetConn.Close()
+
+	// Send success. This is the first byte the server emits on the connection,
+	// and it goes out sealed, inside the answering carrier.
+	if _, err := conn.Write([]byte{0x00}); err != nil {
+		logger.Warn("Failed to write confusion tunnel ack: %v", err)
+		return
+	}
+	logger.Debug("Connected to target, starting confusion relay")
+
+	// Relay data. The sealed frame boundary is the message boundary, so a
+	// control message still arrives as one message rather than as whatever
+	// happened to land in a read.
+	var wg sync.WaitGroup
+	var bytesUp, bytesDown int64
+
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for {
+			data, err := conn.ReadFrame()
+			if err != nil {
+				logger.Debug("Confusion relay: read error: %v", err)
+				return
+			}
+			if len(data) == 0 {
+				continue
+			}
+
+			// Check for control message
+			if control.IsControlMessage(data) {
+				control.HandleServerMessage(conn, data)
+				continue
+			}
+
+			n, err := targetConn.Write(data)
+			atomic.AddInt64(&bytesUp, int64(n))
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 4096)
+		for {
+			n, err := targetConn.Read(buf)
+			if err != nil {
+				logger.Debug("Confusion relay: target read error: %v", err)
+				return
+			}
+			if _, err := conn.Write(buf[:n]); err != nil {
+				logger.Debug("Confusion relay: write error: %v", err)
+				return
+			}
+			atomic.AddInt64(&bytesDown, int64(n))
+		}
+	}()
+
+	wg.Wait()
+	logger.Info("Confusion tunnel closed (up=%d, down=%d)", bytesUp, bytesDown)
+
+	// Update metrics
+	if srvCtx.metrics != nil {
+		srvCtx.metrics.AddBytes(bytesUp, bytesDown)
+	}
+}
+
+// handleConfusionTUNMode handles TUN mode over protocol confusion
+// Now uses shared TUN instead of userspace NAT
+//
+// Reached only from handleProtocolConfusion, which is reached only from
+// classifyConfusion, so the peer holding an address out of the pool has proved
+// it holds a secret. That was not true before 1.11.0: the identity came from
+// the peer's address and the allocation happened for anyone who asked.
+func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx *serverContext, logger *log.Logger) {
+	cfg := srvCtx.cfg
+	conn := sess.conn
+	logger.Debug("Processing Confusion TUN mode, remaining data: %d bytes", len(remainingData))
+
+	// Parse TUN handshake from remaining data: [localIP:4][mtu:2][version:1]
+	// Version byte is optional (v1 clients send 6 bytes, v2 clients send 7 bytes)
+	if len(remainingData) < 6 {
+		logger.Debug("Confusion TUN handshake too short: %d bytes", len(remainingData))
+		conn.Write([]byte{0x01})
+		return
+	}
+
+	// A relay forwards this client upstream and never touches its own TUN, so
+	// only an exit needs the shared device here.
+	if srvCtx == nil || (srvCtx.sharedTUN == nil && srvCtx.upstreamDialer == nil) {
+		logger.Error("Shared TUN not initialized")
+		conn.Write([]byte{0x01})
+		return
+	}
+
+	requestedIP := net.IP(remainingData[0:4])
+	// The identity is the one the marker proved, not the peer's address.
+	// Behind a relay every forwarded client shares the relay's address, so the
+	// old derivation gave them all one identity and one lease.
+	clientID := sess.clientID
+
+	// Check for version byte (v2 clients send 7 bytes total)
+	var clientVersion uint8 = 1 // Default to v1 for backwards compatibility
+	if len(remainingData) >= 7 {
+		clientVersion = remainingData[6]
+		logger.Debug("Confusion TUN client requested: IP=%s, clientID=%s, version=%d", requestedIP, clientID, clientVersion)
+	} else {
+		logger.Debug("Confusion TUN client requested: IP=%s, clientID=%s (legacy v1)", requestedIP, clientID)
+	}
+
+	gate := newTunFrameGate(func(frame []byte) error {
+		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		_, err := conn.Write(frame)
+		return err
+	})
+	writeConfusionFrame := func(frame []byte) error {
+		err := gate.Frame(frame)
+		if FrameDropped(err) {
+			return nil
+		}
+		return err
+	}
+
+	var clientIP, serverIP net.IP
+	var sink tunPacketSink
+
+	if srvCtx.upstreamDialer != nil {
+		// Relay: forward to the upstream exit rather than terminating here.
+		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData,
+			originOf(conn.RemoteAddr()), func(pkt []byte) error {
+				frame := make([]byte, 4+len(pkt))
+				binary.BigEndian.PutUint32(frame[:4], uint32(len(pkt)))
+				copy(frame[4:], pkt)
+				return writeConfusionFrame(frame)
+			})
+		if err != nil {
+			logger.Warn("Confusion TUN relay: upstream dial failed: %v", err)
+			conn.Write([]byte{0x01})
+			return
+		}
+		sink, serverIP, clientIP = relaySink, upServerIP, upClientIP
+		defer func() {
+			relaySink.Close()
+			logger.Info("Confusion TUN relay client disconnected: %s (clientID=%s)", clientIP, clientID)
+		}()
+	} else {
+		// Allocate IP from pool
+		if srvCtx.ipPool != nil {
+			allocatedIP, err := srvCtx.ipPool.Allocate(allocationKey(clientID, originOf(conn.RemoteAddr())), requestedIP, "")
+			if err != nil {
+				logger.Error("Failed to allocate IP from pool: %v", err)
+				conn.Write([]byte{0x01})
+				return
+			}
+			clientIP = allocatedIP
+			logger.Info("Confusion TUN client: allocated IP=%s from pool", clientIP)
+		} else {
+			clientIP = requestedIP
+			logger.Info("Confusion TUN client: IP=%s (no pool)", clientIP)
+		}
+		serverIP = cfg.TunIP
+
+		// Register client with shared TUN (default framing: [length:4][packet:N])
+		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, conn, nil, gate)
+		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
+		sink = localSink
+		defer func() {
+			localSink.Close()
+			logger.Info("Confusion TUN client disconnected: %s (clientID=%s)", clientIP, clientID)
+		}()
+	}
+
+	// Send the handshake response bare, the way every other transport does.
+	// It used to carry an extra [length:4] in front, because the old client
+	// stripped one prefix in its first read and none after; now the sealed
+	// frame carries the boundary and confusion needs no shape of its own.
+	// Local exit: v6 addrs from our pool. Relay: v6 addrs assigned by the
+	// upstream exit (absent when the exit did not negotiate dual-stack).
+	dual := downstreamDualStackAddrs(sink, cfg.IPPoolV6, clientIP)
+	resp := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual)
+	recordDualStackSession(srvCtx, clientVersion, dual)
+	if err := gate.Open(resp); err != nil {
+		logger.Debug("Confusion TUN handshake response write failed: %v", err)
+		return
+	}
+
+	logger.Info("Confusion TUN mode established (client=%s, server=%s)", clientIP, serverIP)
+
+	// Main loop: Client -> sink
+	var packetsUp int64
+	lenBuf := make([]byte, 4)
+
+	for {
+		select {
+		case <-sink.Done():
+			logger.Debug("Confusion TUN loop stopping (client replaced or upstream gone)")
+			return
+		default:
+		}
+
+		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			logger.Debug("Confusion TUN read length error: %v", err)
+			break
+		}
+
+		pktLen := binary.BigEndian.Uint32(lenBuf)
+
+		// Handle keepalive packet (zero length) - echo back
+		if pktLen == 0 {
+			logger.Debug("Confusion TUN: received keepalive, echoing back")
+			writeConfusionFrame(lenBuf)
+			sink.UpdateActivity()
+			continue
+		}
+
+		if pktLen > 65535 || pktLen < 20 {
+			logger.Debug("Invalid confusion TUN packet length: %d", pktLen)
+			continue
+		}
+
+		pkt := make([]byte, pktLen)
+		if _, err := io.ReadFull(conn, pkt); err != nil {
+			logger.Debug("Confusion TUN read data error: %v", err)
+			break
+		}
+
+		pktUp := atomic.AddInt64(&packetsUp, 1)
+		if pktUp%100 == 0 {
+			sink.UpdateActivity()
+		}
+
+		// No double-framing strip any more. The old client's Write put a
+		// [length:4] in front of every write, on top of the one the VPN layer
+		// had already put there, and the server guessed which of the two it was
+		// looking at by comparing the inner number against the outer length - a
+		// guess that corrupts any packet whose first four bytes happen to hold
+		// its own length minus four. The sealed frame carries the boundary now,
+		// so there is exactly one length prefix and nothing to guess.
+		if err := sink.WritePacket(pkt); err != nil {
+			logger.Debug("Confusion TUN sink write error: %v", err)
+		}
+	}
+}
+
+// tunnelIdentity is what the node ceiling counts, and an empty result means
+// "do not count this session at all".
+//
+// It used to fall back to the peer address when no client id was supplied. That
+// was wrong, and wrong in the direction that matters: handleTLSConnection
+// reaches this funnel with an empty id after nothing but a plain TLS handshake,
+// which anyone can complete because we serve a certificate to everyone. A peer
+// that never authenticated could therefore both measure the ceiling by opening
+// connections until refused - the exact fingerprint the placement was chosen to
+// avoid - and exhaust it, denying service to real users with no credential at
+// all.
+//
+// So only a session that arrives with an identity is counted. The cost is that
+// transports which authenticate against a single shared secret pass no id and
+// go uncounted, so the ceiling under-counts on those. That is the safe error:
+// it protects less than configured, rather than handing an unauthenticated peer
+// a lever. Closing it properly means each call site stating whether its peer
+// authenticated, which is a signature change across every transport.
+func tunnelIdentity(clientID string) string {
+	return clientID
+}
+
+// handleRawTunnel handles raw tunnel connections
+// clientID is used for TUN mode to track IP allocation (e.g. "reality:abcd1234")
+func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, clientID clientIdentity) {
+	logger.Debug("Starting raw tunnel mode")
+
+	// Node ceiling. Here rather than at accept on purpose: every transport
+	// funnels through this function once its client has authenticated, so a
+	// peer that cannot authenticate never reaches the ceiling and cannot
+	// measure it. See nodecap.go for why that placement is the whole design.
+	//
+	// A refused client currently has nowhere to go - see nodeCapNoFailover - so
+	// this only fires when an operator has deliberately set a ceiling.
+	release, admitted := nodeCapacity.admit(tunnelIdentity(clientID.id), time.Now())
+	if !admitted {
+		logger.Warn("Node ceiling reached, refusing a new session (client: %s)", clientID)
+		return
+	}
+	defer release()
+
+	// Track per-client connection for metrics. Use a closure on the conn
+	// variable so the defer picks up the kTLS-wrapped value if we hand
+	// the socket over later via ktls.TryEnable + registry.SwapConn.
+	if srvCtx.registry != nil && clientID.id != "" {
+		if err := srvCtx.registry.AddConnection(clientID.id, conn); err != nil {
+			logger.Warn("Failed to track connection for client %s: %v", clientID, err)
+		} else {
+			defer func() {
+				srvCtx.registry.RemoveConnection(clientID.id, conn)
+			}()
+		}
+	}
+
+	// Read first byte to check for TUN mode
+	modeBuf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, modeBuf); err != nil {
+		logger.Debug("Failed to read mode byte: %v", err)
+		return
+	}
+
+	// Check if this is TUN mode (0x02)
+	if modeBuf[0] == 0x02 {
+		// Read TUN handshake: [localIP:4][mtu:2][version:1]
+		// Read at least 6 bytes (legacy), up to 7 (with version)
+		tunHandshake := make([]byte, 7)
+		n, err := io.ReadAtLeast(conn, tunHandshake, 6)
+		if err != nil && err != io.ErrUnexpectedEOF {
+			logger.Debug("Failed to read TUN handshake: %v (got %d bytes)", err, n)
+			return
+		}
+		logger.Debug("Raw tunnel TUN handshake: read %d bytes", n)
+		handleTUNModeWithHandshake(conn, srvCtx, logger, tunHandshake[:n], clientID)
+		return
+	}
+
+	// Regular SOCKS proxy mode - mode byte was high byte of address length
+	lenBuf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, lenBuf); err != nil {
+		logger.Debug("Failed to read address length low byte: %v", err)
+		return
+	}
+
+	addrLen := int(modeBuf[0])<<8 | int(lenBuf[0])
+	if addrLen > 256 || addrLen < 3 {
+		logger.Debug("Invalid address length: %d", addrLen)
+		return
+	}
+
+	addrBuf := make([]byte, addrLen)
+	if _, err := io.ReadFull(conn, addrBuf); err != nil {
+		logger.Debug("Failed to read address: %v", err)
+		return
+	}
+
+	targetAddr := string(addrBuf)
+	logger.Info("Tunnel to: %s", targetAddr)
+
+	// Connect to target (via upstream if configured)
+	var targetConn net.Conn
+	var err error
+	if srvCtx.upstreamDialer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		cancel()
+	} else {
+		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
+	}
+	if err != nil {
+		logger.Warn("Failed to connect to %s: %v", targetAddr, err)
+		conn.Write([]byte{0x01})
+		return
+	}
+	defer targetConn.Close()
+
+	// Send success ack
+	if _, err := conn.Write([]byte{0x00}); err != nil {
+		logger.Warn("Failed to write success ack: %v", err)
+		return
+	}
+	logger.Debug("Connected to target, starting relay")
+
+	// Auth phase complete: hand the socket over to kTLS for the byte-relay phase.
+	// At this point the TLS stack's read buffer is empty (we read mode + addr
+	// to completion) and tls.Conn.Write has written the ack synchronously to
+	// the kernel send buffer.
+	preSwap := conn
+	conn = ktls.TryEnable(conn, "tired-raw")
+	if conn != preSwap && srvCtx.registry != nil && clientID.id != "" {
+		// Replace the stored *tls.Conn pointer so forced-disconnect Close()
+		// targets the live ktls.Conn wrapper rather than the stale *tls.Conn.
+		srvCtx.registry.SwapConn(clientID.id, preSwap, conn)
+	}
+
+	// Relay data
+	var wg sync.WaitGroup
+	var bytesUp, bytesDown int64
+
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		n, _ := optimizedRelay(targetConn, conn)
+		atomic.AddInt64(&bytesUp, n)
+		if tc, ok := targetConn.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		n, _ := optimizedRelay(conn, targetConn)
+		atomic.AddInt64(&bytesDown, n)
+	}()
+
+	wg.Wait()
+
+	logger.Info("Tunnel closed (up=%d, down=%d)", bytesUp, bytesDown)
+
+	// Update metrics
+	if srvCtx.metrics != nil {
+		srvCtx.metrics.AddBytes(bytesUp, bytesDown)
+	}
+
+	// Update per-client metrics
+	if srvCtx.registry != nil && clientID.id != "" {
+		srvCtx.registry.AddBytes(clientID.id, bytesUp, bytesDown)
+	}
+}
+
+// handleTUNMode handles TUN-based VPN connections
+func handleTUNMode(conn net.Conn, cfg *Config, logger *log.Logger) {
+	handleTUNModeWithContext(conn, cfg, nil, logger)
+}
+
+// handleTUNModeWithHandshake handles TUN mode with pre-read handshake data (for QUIC)
+func handleTUNModeWithHandshake(conn net.Conn, srvCtx *serverContext, logger *log.Logger, handshake []byte, clientID clientIdentity) {
+	handleTUNModeCore(conn, srvCtx.cfg, srvCtx, logger, handshake, clientID)
+}
+
+// handleTUNModeWithContext handles TUN-based VPN connections with server context (for IP pool)
+func handleTUNModeWithContext(conn net.Conn, cfg *Config, srvCtx *serverContext, logger *log.Logger) {
+	logger.Debug("Processing TUN mode connection")
+
+	// Read TUN handshake: [localIP:4][mtu:2][version:1] (7 bytes for v1 clients, 6 bytes for legacy)
+	// We read 7 bytes to support version detection, but legacy clients only send 6
+	handshake := make([]byte, 7)
+	n, err := conn.Read(handshake)
+	if err != nil || n < 6 {
+		logger.Debug("Failed to read TUN handshake: %v (got %d bytes)", err, n)
+		return
+	}
+
+	handleTUNModeCore(conn, cfg, srvCtx, logger, handshake[:n], clientIdentity{})
+}
+
+// resolveTunMTU returns the configured TUN MTU, falling back to the package
+// default when unset. Both the shared interface setup and the per-connection
+// MTU negotiation go through here so the interface MTU and the MSS clamp can
+// never drift apart.
+func resolveTunMTU(cfg *Config) int {
+	if cfg.TunMTU > 0 {
+		return cfg.TunMTU
+	}
+	return tun.DefaultMTU
+}
+
+// negotiateMTU picks the effective tunnel MTU as min(clientMTU, serverMTU),
+// keeping the legacy guard for clients that advertise no MTU (clientMTU == 0).
+func negotiateMTU(clientMTU, serverMTU int) int {
+	if clientMTU > 0 && clientMTU < serverMTU {
+		return clientMTU
+	}
+	return serverMTU
+}
+
+// handleTUNModeCore is the core TUN mode handler
+// authClientID is the authenticated client ID from QUIC/etc (empty if not available)
+func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger *log.Logger, handshake []byte, authClientID clientIdentity) {
+	requestedIP := net.IP(handshake[0:4])
+	clientMTU := int(binary.BigEndian.Uint16(handshake[4:6]))
+	// Negotiate MTU: use min(clientMTU, serverMTU) as effective MTU.
+	// serverMTU must match the shared TUN interface MTU (both via resolveTunMTU)
+	// so the MSS clamp below stays in lock-step with the interface.
+	serverMTU := resolveTunMTU(cfg)
+	effectiveMTU := negotiateMTU(clientMTU, serverMTU)
+	logger.Debug("MTU negotiation: client=%d, server=%d, effective=%d", clientMTU, serverMTU, effectiveMTU)
+
+	// Check client version for extended capabilities
+	// Old format: [localIP:4][mtu:2] = 6 bytes
+	// New format: [localIP:4][mtu:2][version:1] = 7 bytes
+	clientVersion := byte(0x00)
+	if len(handshake) >= 7 {
+		clientVersion = handshake[6]
+		logger.Debug("TUN client version: 0x%02x (handshake len=%d)", clientVersion, len(handshake))
+	} else {
+		logger.Debug("TUN legacy client (handshake len=%d)", len(handshake))
+	}
+
+	// Check if client requests auto-assignment (0.0.0.0)
+	isAutoRequest := requestedIP.Equal(net.IPv4zero) || requestedIP.Equal(net.IPv4(0, 0, 0, 0))
+
+	// Use authenticated clientID if available, otherwise fallback to connection-based ID
+	// A client that authenticated carries whatever identity that transport
+	// resolved, including whether it distinguishes one client from another.
+	// Without one, fall back to the peer address - which on a relay is the
+	// relay's own address and therefore the same for every client behind it,
+	// so it is shared rather than per-client.
+	clientID := authClientID
+	if clientID.id == "" {
+		clientID = sharedIdentity(fmt.Sprintf("tun:%s", conn.RemoteAddr().String()))
+	}
+
+	logger.Info("TUN client request: IP=%s, clientID=%s", requestedIP, clientID)
+
+	// Multi-hop relay: when -upstream is set this node is a relay, not an exit.
+	// Forward the downstream client's raw IP packets to the upstream exit over a
+	// stego TUN tunnel instead of terminating them on our local TUN. Without this
+	// branch the loop below writes client packets into our own TUN device, the
+	// kernel never routes them to the upstream, and the client gets no exit.
+	if srvCtx != nil && srvCtx.upstreamDialer != nil {
+		relayTUNToUpstream(conn, srvCtx, logger, handshake)
+		return
+	}
+
+	// Check if shared TUN is available. If this fires, the instance was started
+	// without -ip-pool (the only thing that creates the shared TUN, see
+	// initIPPool) and is not a relay, so it cannot terminate native full-tunnel
+	// clients such as the Android app (issue #51). Not IPv6/auto-IP specific:
+	// this guard runs before any IP-family branch.
+	if srvCtx == nil || srvCtx.sharedTUN == nil {
+		logger.Error("Shared TUN not initialized: server started without -ip-pool; native full-tunnel clients cannot connect. Set -ip-pool (e.g. 10.8.0.0/24) to enable")
+		resp := make([]byte, 9)
+		resp[0] = 0x03 // Error: TUN not available
+		conn.Write(resp)
+		return
+	}
+
+	// Determine client IP
+	var clientIP net.IP
+	var ipFromPool bool
+
+	if srvCtx.ipPool != nil {
+		// Use IP Pool - it returns same IP for same lease key (from Redis leases)
+		var err error
+		clientIP, err = srvCtx.ipPool.Allocate(allocationKey(clientID, originOf(conn.RemoteAddr())), requestedIP, "")
+		if err != nil {
+			logger.Warn("IP allocation failed: %v", err)
+			resp := make([]byte, 9)
+			resp[0] = 0x01 // Error: pool exhausted
+			conn.Write(resp)
+			return
+		}
+		ipFromPool = true
+		logger.Info("IP allocated from pool: %s (requested=%s, clientID=%s)", clientIP, requestedIP, clientID)
+	} else {
+		// No pool - use requested IP (legacy behavior)
+		if isAutoRequest {
+			logger.Warn("Auto IP requested but no IP pool configured")
+			resp := make([]byte, 9)
+			resp[0] = 0x02 // Error: no pool
+			conn.Write(resp)
+			return
+		}
+		clientIP = requestedIP
+	}
+
+	serverIP := cfg.TunIP
+
+	// Build response based on client version via the shared constructor
+	// (buildTUNHandshakeResponse covers the legacy/v1/v2/flags-only layouts and
+	// the v0x04 dual-stack block).
+	//
+	// Auto-MTU: a v3 client understands the active probe. As the terminating exit
+	// (no upstream relay - that branch returned earlier) we always echo probe
+	// frames, so advertise the capability via the flags byte (bit 0x02).
+	caps := tunHandshakeCaps{mtuProbe: true}
+	if cfg.PortRange != "" {
+		// Get port range bounds for extended response
+		portStart, portEnd := getPortRangeBounds(cfg.PortRange)
+		if portStart > 0 && portEnd > portStart {
+			caps.portHopping = true
+			caps.portStart, caps.portEnd = portStart, portEnd
+			caps.hopInterval = int(cfg.PortHopInterval.Seconds())
+			caps.hopStrategy = portHopStrategyByte(cfg.PortHopStrategy)
+			caps.hopSeed = []byte(cfg.PortHopSeed)
+			logger.Info("Advertising port hopping: %d-%d, interval=%ds, strategy=%s, seed_len=%d",
+				portStart, portEnd, caps.hopInterval, cfg.PortHopStrategy, len(caps.hopSeed))
+		}
+	}
+	dual := deriveDualStackAddrs(cfg.IPPoolV6, clientIP)
+	resp := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, caps, dual)
+	recordDualStackSession(srvCtx, clientVersion, dual)
+	if dual != nil && clientVersion >= tunClientVersionDualStack {
+		logger.Info("Advertising dual-stack: server6=%s client6=%s", dual.ServerIP6, dual.ClientIP6)
+	}
+
+	// One gate owns every downstream write on this tunnel: the handshake
+	// response below, the dispatcher's frames, the keepalive echo and the
+	// auto-MTU probe reply. See tun_frame_gate.go.
+	gate := newTunFrameGate(func(frame []byte) error {
+		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		_, err := conn.Write(frame)
+		return err
+	})
+	if err := gate.Open(resp); err != nil {
+		logger.Debug("Failed to send TUN response: %v", err)
+		if ipFromPool {
+			srvCtx.ipPool.Release(clientIP)
+		}
+		return
+	}
+
+	// Register client with shared TUN
+	// Default framing: [length:4][packet:N]
+	writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, conn, nil, gate)
+	defer func() {
+		srvCtx.sharedTUN.UnregisterClient(clientIP, writer)
+		// Don't release IP - it stays allocated for reconnects
+		logger.Info("TUN client disconnected: %s (clientID=%s)", clientIP, clientID)
+	}()
+
+	logger.Info("TUN mode established (client=%s, server=%s, tun=%s)", clientIP, serverIP, srvCtx.sharedTUN.Name())
+
+	// Main loop: Client -> TUN (client-bound traffic)
+	// TUN -> Client is handled by SharedTUN packet dispatcher
+	var packetsUp int64
+	lenBuf := make([]byte, 4)
+
+	for {
+		// Check if client disconnected (replaced by new connection)
+		select {
+		case <-writer.Done():
+			logger.Debug("Client->TUN loop stopping (client replaced)")
+			return
+		default:
+		}
+
+		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			logger.Debug("TUN read length error: %v", err)
+			break
+		}
+
+		pktLen := binary.BigEndian.Uint32(lenBuf)
+
+		// Handle keepalive packet (zero length) - echo back
+		if pktLen == 0 {
+			logger.Debug("Received keepalive, echoing back")
+			if err := gate.Frame(lenBuf); err != nil && !FrameDropped(err) {
+				logger.Debug("Keepalive echo write failed: %v", err)
+			}
+			writer.UpdateActivity()
+			continue
+		}
+
+		if pktLen > 65535 || pktLen < 20 {
+			logger.Debug("Invalid packet length: %d", pktLen)
+			continue
+		}
+
+		pkt := make([]byte, pktLen)
+		if _, err := io.ReadFull(conn, pkt); err != nil {
+			logger.Debug("TUN read packet error: %v", err)
+			break
+		}
+
+		// Auto-MTU: if this is a probe REQUEST, reflect a same-size REPLY and do
+		// NOT write it to the TUN device. The reply tests the return path at the
+		// same size. Detection by marker precedes any IP handling.
+		if tun.IsProbeFrame(pkt) {
+			if reply := tun.MakeProbeReply(pkt); reply != nil {
+				if cfg.Debug {
+					logger.Debug("Auto-MTU: echoing PROBE_REPLY size=%d", len(reply))
+				}
+				replyFrame := make([]byte, 4+len(reply))
+				binary.BigEndian.PutUint32(replyFrame[:4], uint32(len(reply)))
+				copy(replyFrame[4:], reply)
+				if err := gate.Frame(replyFrame); err != nil && !FrameDropped(err) {
+					logger.Debug("Auto-MTU reply write failed: %v", err)
+				}
+				writer.UpdateActivity()
+			}
+			// A non-request or malformed probe frame is dropped silently.
+			continue
+		}
+
+		// Clamp TCP MSS on SYN/SYN-ACK to fit negotiated tunnel MTU
+		tun.ClampTCPMSS(pkt, effectiveMTU)
+
+		pktUp := atomic.AddInt64(&packetsUp, 1)
+
+		// Update activity timestamp (every 100 packets to reduce overhead)
+		if pktUp%100 == 0 {
+			writer.UpdateActivity()
+		}
+		if pktUp <= 5 || pktUp%100 == 0 {
+			logger.Debug("Client->TUN: writing %d bytes to TUN (pkt #%d)", pktLen, pktUp)
+		}
+
+		// Write packet to shared TUN device - kernel handles routing
+		if _, err := srvCtx.sharedTUN.TUNDevice().Write(pkt); err != nil {
+			logger.Debug("TUN write error: %v", err)
+		}
+	}
+}
+
+// relayTUNToUpstream bridges a downstream TUN client to the upstream exit when
+// this node runs in multi-hop relay mode (-upstream set). It opens a stego TUN
+// tunnel to the upstream, relays the upstream's handshake response (including the
+// IP the upstream assigned) back to the downstream client, then byte-copies the
+// raw [len:4][pkt:N] frames (and zero-length keepalives) in both directions. The
+// relay never touches its own sharedTUN/ippool for these clients.
+func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger, handshake []byte) {
+	// Carry the downstream client's identity upstream. Without it every client
+	// behind this relay reaches the exit as the same anonymous "global" client,
+	// so the exit's sticky IP pool hands them all one tunnel IP and they evict
+	// each other. A relay further down may have attached the origin already;
+	// keep that one so the chain reports the real client, not the middle hop.
+	handshake, origin := splitTUNOrigin(handshake)
+	if origin == "" {
+		origin = originOf(conn.RemoteAddr())
+	}
+
+	// The client's handshake version travels upstream verbatim, so it is also
+	// what the exit answered; keep it for the dual-stack accounting below.
+	clientVersion := byte(0x00)
+	if len(handshake) >= 7 {
+		clientVersion = handshake[6]
+	}
+
+	dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	upstreamConn, resp, err := srvCtx.upstreamDialer.DialTUN(dialCtx, handshake, origin)
+	cancel()
+	if err != nil {
+		logger.Warn("Relay: upstream TUN dial failed: %v", err)
+		// Mirror the local error response so the client fails fast instead of hanging.
+		failResp := make([]byte, 9)
+		failResp[0] = 0x01
+		conn.Write(failResp)
+		return
+	}
+	defer upstreamConn.Close()
+
+	// Forward the upstream's handshake response (assigned IP etc.) to the client.
+	if _, err := conn.Write(resp); err != nil {
+		logger.Debug("Relay: failed to send handshake response to client: %v", err)
+		return
+	}
+
+	// Account the dual-stack session here too. Unlike the morph/confusion/h2/
+	// polling relay paths, this one never builds a response of its own (it is
+	// the plain hop-to-hop path and forwards the exit's bytes verbatim), so
+	// without this call the counter misses exactly the path that carries most
+	// relayed traffic. Counted after the write succeeded: the session only
+	// exists once the client has the addresses.
+	recordRelayedDualStackSession(srvCtx, clientVersion, resp)
+
+	logger.Info("Relay TUN bridge established (client=%s, upstream-assigned=%s)",
+		conn.RemoteAddr(), net.IP(resp[5:9]))
+
+	// Bidirectional transparent copy with an idle watchdog. Both ends speak the
+	// identical TUN wire format, so no reframing is needed.
+	idleTimeout := srvCtx.cfg.RelayIdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = defaultRelayIdleTimeout
+	}
+	runIdleWatchedBridge(conn, upstreamConn, idleTimeout, logger)
+
+	logger.Info("Relay TUN bridge closed (client=%s)", conn.RemoteAddr())
+}
+
+// runIdleWatchedBridge byte-copies traffic in both directions between a and b
+// and force-closes BOTH once no bytes flow in either direction for idleTimeout.
+// It returns when both copy directions have finished (peer close, error, or the
+// idle force-close).
+//
+// The idle watchdog exists because SetReadDeadline cannot reap a stuck relay
+// bridge: the downstream may be an h2TunConn whose SetReadDeadline is a no-op,
+// so a silently-vanished client leaves the client->upstream copy blocked on Read
+// forever, pinning the admission slot and the upstream's socket buffers. Both
+// copy goroutines stamp lastActivity on every read; the watchdog closes both
+// sides once the stamp ages past idleTimeout. Real traffic - including 10s TUN
+// keepalive frames - keeps the stamp fresh, so a live session is never reaped.
+func runIdleWatchedBridge(a, b net.Conn, idleTimeout time.Duration, logger *log.Logger) {
+	var once sync.Once
+	closeBoth := func() {
+		once.Do(func() {
+			a.Close()
+			b.Close()
+		})
+	}
+
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
+	watchdogDone := make(chan struct{})
+	go func() {
+		// Poll at a quarter of the timeout so the bridge is reaped within
+		// ~idleTimeout of going silent, without a tight spin.
+		interval := idleTimeout / 4
+		if interval < time.Second {
+			interval = time.Second
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-watchdogDone:
+				return
+			case <-ticker.C:
+				idle := time.Since(time.Unix(0, lastActivity.Load()))
+				if idle >= idleTimeout {
+					if logger != nil {
+						logger.Info("Relay TUN bridge idle for %s, force-closing", idle.Round(time.Second))
+					}
+					closeBoth()
+					return
+				}
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer closeBoth()
+		copyWithActivity(b, a, &lastActivity) // a -> b
+	}()
+	go func() {
+		defer wg.Done()
+		defer closeBoth()
+		copyWithActivity(a, b, &lastActivity) // b -> a
+	}()
+	wg.Wait()
+	close(watchdogDone)
+}
+
+// copyWithActivity is io.Copy with an activity stamp: it records time.Now (as
+// UnixNano) into lastActivity on every successful read from src. The relay
+// idle-watchdog reads this stamp to detect a silent bridge and force-close it.
+// Buffer size matches io.Copy's internal 32KB.
+func copyWithActivity(dst io.Writer, src io.Reader, lastActivity *atomic.Int64) (int64, error) {
+	buf := make([]byte, 32*1024)
+	var written int64
+	for {
+		nr, rerr := src.Read(buf)
+		if nr > 0 {
+			lastActivity.Store(time.Now().UnixNano())
+			nw, werr := dst.Write(buf[:nr])
+			written += int64(nw)
+			if werr != nil {
+				return written, werr
+			}
+			if nw < nr {
+				return written, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return written, nil
+			}
+			return written, rerr
+		}
+	}
+}
+
+// setupH2Tunnel establishes the tunnel connection for HTTP/2 stego
+func setupH2Tunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srvCtx *serverContext, logger *log.Logger) {
+	logger.Debug("Setting up HTTP/2 stego tunnel: %d bytes", len(data))
+
+	// Parse target address from data
+	// Format: [mode:1][...] where mode=0x02 is TUN, otherwise [addrLen:2][address:N]
+	if len(data) < 2 {
+		logger.Debug("Tunnel data too short")
+		return
+	}
+
+	// Check for TUN mode (first byte = 0x02)
+	if data[0] == 0x02 {
+		logger.Info("HTTP/2 Stego TUN mode detected")
+		setupH2TUNTunnel(tunnel, framer, data[1:], srvCtx, logger)
+		return
+	}
+
+	addrLen := int(data[0])<<8 | int(data[1])
+	if addrLen > len(data)-2 || addrLen < 3 {
+		logger.Debug("Invalid address length: %d", addrLen)
+		return
+	}
+	targetAddr := string(data[2 : 2+addrLen])
+	logger.Info("HTTP/2 Stego tunnel to: %s", targetAddr)
+
+	// Connect to target (via upstream if configured)
+	var targetConn net.Conn
+	var err error
+	if srvCtx.upstreamDialer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		cancel()
+	} else {
+		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
+	}
+	if err != nil {
+		logger.Warn("Failed to connect to %s: %v", targetAddr, err)
+		// Send failure response
+		sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
+		return
+	}
+
+	// Store connection in tunnel state (don't close - will be closed by caller)
+	tunnel.targetConn = targetConn
+
+	// Send success response
+	sendStegoResponse(framer, tunnel.streamID, []byte{0x00}, tunnel.secret)
+	logger.Debug("Connected to target, starting HTTP/2 stego relay")
+
+	// Start goroutine to read from target and send via HTTP/2
+	go func() {
+		buf := make([]byte, 1400)
+		for {
+			n, err := targetConn.Read(buf)
+			if err != nil {
+				logger.Debug("Target read error: %v", err)
+				return
+			}
+			tunnel.mu.Lock()
+			sendStegoResponse(framer, tunnel.streamID, buf[:n], tunnel.secret)
+			tunnel.mu.Unlock()
+		}
+	}()
+}
+
+// sendStegoResponse sends data via HTTP/2 steganography, keyed to the
+// authenticated client secret so the frame opens with a per-frame keyed marker
+// instead of the old constant "TIRD".
+func sendStegoResponse(framer *http2.Framer, streamID uint32, data []byte, secret []byte) {
+	// Frame format: [nonce][marker][flags:1][length:2][data:N][cover:M]
+	hdr, err := strategy.BuildStegoServerFrameHeader(secret)
+	if err != nil {
+		return
+	}
+	h := len(hdr)
+	// Bucketed cover instead of a fixed 30 bytes, so the server->client record
+	// length no longer tracks the packet it carries (the client recovers the
+	// real length from the Length field and drops the trailing cover).
+	base := h + 3 + len(data)
+	coverLen := strategy.StegoTunCoverLen(base)
+	response := make([]byte, base+coverLen)
+	copy(response[0:h], hdr)
+	response[h] = 0x00 // Raw data flag
+	binary.BigEndian.PutUint16(response[h+1:h+3], uint16(len(data)))
+	copy(response[h+3:base], data)
+	if coverLen > 0 {
+		rand.Read(response[base:]) // Cover traffic
+	}
+
+	framer.WriteData(streamID, false, response)
+}
+
+// h2StegoFrameFunc creates framing function for H2 Stego TUN->Client packets
+// Format: [len:4][packet:N]
+func h2StegoFrameFunc(framer *http2.Framer, streamID *uint32, secret []byte, mu *sync.Mutex) func([]byte) []byte {
+	return func(pkt []byte) []byte {
+		// Frame packet: [len:4][packet:N]
+		framed := make([]byte, 4+len(pkt))
+		binary.BigEndian.PutUint32(framed[:4], uint32(len(pkt)))
+		copy(framed[4:], pkt)
+
+		// Send via H2 stego
+		mu.Lock()
+		sendStegoResponse(framer, *streamID, framed, secret)
+		mu.Unlock()
+
+		return nil // Already sent
+	}
+}
+
+// setupH2TUNTunnel handles TUN mode over HTTP/2 steganography
+// Now uses shared TUN instead of userspace NAT
+func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srvCtx *serverContext, logger *log.Logger) {
+	cfg := srvCtx.cfg
+	logger.Debug("Setting up HTTP/2 Stego TUN tunnel: %d bytes", len(data))
+
+	// A relay forwarding a downstream client appends that client's origin after
+	// the handshake; strip it before parsing the fixed fields.
+	data, origin := splitTUNOrigin(data)
+	if origin == "" {
+		origin = tunnel.remoteAddr
+	}
+
+	// Parse TUN handshake: [localIP:4][mtu:2][version:1]
+	// Version byte is optional (v1 clients send 6 bytes, v2 clients send 7 bytes)
+	if len(data) < 6 {
+		logger.Debug("H2 TUN handshake too short: %d bytes", len(data))
+		sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
+		return
+	}
+
+	// A relay forwards this client upstream and never touches its own TUN, so
+	// only an exit needs the shared device here.
+	if srvCtx == nil || (srvCtx.sharedTUN == nil && srvCtx.upstreamDialer == nil) {
+		logger.Error("Shared TUN not initialized")
+		sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
+		return
+	}
+
+	requestedIP := net.IP(data[0:4])
+
+	// Check for version byte (v2 clients send 7 bytes total)
+	var clientVersion uint8 = 1 // Default to v1 for backwards compatibility
+	if len(data) >= 7 {
+		clientVersion = data[6]
+		logger.Debug("H2 TUN client requested: IP=%s, version=%d", requestedIP, clientVersion)
+	} else {
+		logger.Debug("H2 TUN client requested: IP=%s (legacy v1)", requestedIP)
+	}
+
+	// Create H2 conn adapter (also marks this tunnel as TUN mode)
+	h2Conn := &h2TunConn{
+		framer:   framer,
+		streamID: &tunnel.streamID, // Pointer so it can be updated
+		cfg:      cfg,
+		secret:   tunnel.secret,
+		mu:       &tunnel.mu,
+		done:     make(chan struct{}),
+	}
+
+	// sendPacketDown wraps one IP packet in the stego TUN framing the client
+	// expects: [len:4][packet:N].
+	gate := newTunFrameGate(func(frame []byte) error {
+		tunnel.mu.Lock()
+		sendStegoResponse(framer, tunnel.streamID, frame, tunnel.secret)
+		tunnel.mu.Unlock()
+		return nil
+	})
+	tunnel.tunGate = gate
+	sendPacketDown := func(pkt []byte) error {
+		framed := make([]byte, 4+len(pkt))
+		binary.BigEndian.PutUint32(framed[:4], uint32(len(pkt)))
+		copy(framed[4:], pkt)
+
+		if err := gate.Frame(framed); err != nil && !FrameDropped(err) {
+			return err
+		}
+		return nil
+	}
+
+	var clientIP, serverIP net.IP
+
+	if srvCtx.upstreamDialer != nil {
+		// Relay: forward to the upstream exit rather than terminating here.
+		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, data, origin, sendPacketDown)
+		if err != nil {
+			logger.Warn("H2 TUN relay: upstream dial failed: %v", err)
+			sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
+			return
+		}
+		clientIP, serverIP = upClientIP, upServerIP
+		tunnel.sink = relaySink
+	} else {
+		// Allocate IP from pool
+		if srvCtx.ipPool != nil {
+			leaseKey := allocationKey(tunnel.clientID, origin)
+			allocatedIP, err := srvCtx.ipPool.Allocate(leaseKey, requestedIP, "")
+			if err != nil {
+				logger.Error("Failed to allocate IP from pool: %v", err)
+				sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
+				return
+			}
+			clientIP = allocatedIP
+			logger.Info("H2 TUN client: allocated IP=%s from pool (requested=%s, clientID=%s, origin=%s)", clientIP, requestedIP, tunnel.clientID, origin)
+		} else {
+			clientIP = requestedIP
+			logger.Info("H2 TUN client: IP=%s (no pool)", clientIP)
+		}
+		serverIP = cfg.TunIP
+		h2Conn.clientIP = clientIP
+
+		// Register client with shared TUN. The default [len:4][packet:N] framing
+		// is what the gate's writer wraps in a stego response, so there is no
+		// longer a frameFunc that sends on its own and returns nil.
+		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, tunnel.clientID.id, h2Conn, nil, gate)
+		tunnel.sharedTUNWriter = writer
+		tunnel.sharedTUN = srvCtx.sharedTUN
+		tunnel.sink = newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
+	}
+
+	h2Conn.clientIP = clientIP
+	tunnel.targetConn = h2Conn // Mark as TUN mode
+
+	// Send success response: shared-constructor payload sent as raw stego data.
+	// Local exit: v6 addrs from our pool. Relay: v6 addrs assigned by the
+	// upstream exit (absent when the exit did not negotiate dual-stack).
+	dual := downstreamDualStackAddrs(tunnel.sink, cfg.IPPoolV6, clientIP)
+	resp := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual)
+	recordDualStackSession(srvCtx, clientVersion, dual)
+	// Through the gate, like every other write on this tunnel: the h2 framer is
+	// not safe for concurrent use (one shared scratch buffer, several writes per
+	// frame) and this response used to take no lock at all.
+	if err := tunnel.tunGate.Open(resp); err != nil {
+		logger.Debug("H2 TUN handshake response write failed: %v", err)
+		return
+	}
+
+	logger.Info("H2 TUN mode established (client=%s, server=%s)", clientIP, serverIP)
+}
+
+// h2TunConn adapts HTTP/2 framer to net.Conn interface for SharedTUN
+type h2TunConn struct {
+	framer   *http2.Framer
+	streamID *uint32
+	cfg      *Config
+	secret   []byte // Authenticated client secret, keys the stego markers
+	mu       *sync.Mutex
+	clientIP net.IP
+	done     chan struct{}
+}
+
+func (c *h2TunConn) Write(p []byte) (int, error) {
+	// For H2 TUN, writing is handled by framePacket function
+	// This method may be called but actual sending is done elsewhere
+	return len(p), nil
+}
+
+func (c *h2TunConn) Read(p []byte) (int, error)         { return 0, io.EOF }
+func (c *h2TunConn) Close() error                       { return nil }
+func (c *h2TunConn) LocalAddr() net.Addr                { return nil }
+func (c *h2TunConn) RemoteAddr() net.Addr               { return nil }
+func (c *h2TunConn) SetDeadline(t time.Time) error      { return nil }
+func (c *h2TunConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *h2TunConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// serveFakeWebsite serves a fake website to probes
+// serveFakeHTTPResponse serves a fake HTTP response
+func serveFakeHTTPResponse(conn net.Conn, cfg *Config, logger *log.Logger) {
+	serveFakeWebsite(conn, cfg, logger)
+}
+
+// handleConfusionData handles extracted confusion data
+func handleConfusionData(conn net.Conn, data []byte, srvCtx *serverContext, logger *log.Logger) {
+	_ = srvCtx.cfg // cfg not used but keep pattern consistent
+	// Find length after TIRED magic
+	if len(data) < 9 {
+		return
+	}
+
+	dataLen := binary.BigEndian.Uint32(data[5:9])
+	logger.Debug("Confusion data length: %d", dataLen)
+
+	// Acknowledge
+	conn.Write([]byte("TIRED"))
+
+	// Continue as raw tunnel
+	handleRawTunnel(conn, srvCtx, logger, clientIdentity{})
+}
+
+// Helper functions
+
+// detectTimingKnock matches the head of the first knock packet against secret.
+//
+// v2 layout of packet 0: [seq=0][bucket:8][nonce:16][tag:16][body...]. The
+// nonce and bucket are in the clear; the tag is HKDF(secret, nonce, bucket), so
+// a peer that does not hold the secret cannot produce it. Matching the tag lets
+// the server pick the right secret from a fixed-length prefix, without first
+// reading a secret-dependent packet length. A stale bucket is rejected before
+// any HKDF work, so garbage costs nothing.
+func detectTimingKnock(data []byte, secret []byte) bool {
+	if len(data) < strategy.KnockHeaderLen+strategy.KnockTagLen || data[0] != 0x00 {
+		return false
+	}
+
+	bucket := int64(binary.BigEndian.Uint64(data[1:9]))
+	if !strategy.KnockBucketFresh(bucket) {
+		return false
+	}
+
+	nonce := data[9:strategy.KnockHeaderLen]
+	expectedTag := strategy.KnockTag(secret, nonce, bucket)
+	return hmac.Equal(data[strategy.KnockHeaderLen:strategy.KnockHeaderLen+strategy.KnockTagLen], expectedTag)
+}
+
+// detectTimingKnockWithRegistry checks timing knock against per-client secrets and global secret
+// Returns (matched, secret, clientID)
+func detectTimingKnockWithRegistry(data []byte, srvCtx *serverContext) (bool, []byte, clientIdentity) {
+	// 1. Try per-client secrets
+	if srvCtx.registry != nil {
+		for _, client := range srvCtx.registry.ListClients() {
+			if detectTimingKnock(data, []byte(client.Secret)) {
+				log.Debug("Timing knock matched client: %s (id: %s)", client.Name, client.ID)
+				return true, []byte(client.Secret), registryIdentity(client.ID)
+			}
+		}
+	}
+
+	// 2. Fallback to global secret
+	if len(srvCtx.cfg.Secret) > 0 && detectTimingKnock(data, srvCtx.cfg.Secret) {
+		log.Debug("Timing knock matched global secret")
+		return true, srvCtx.cfg.Secret, sharedIdentity(globalClientID)
+	}
+
+	return false, nil, clientIdentity{}
+}
+
+// verifyFullKnockSequence reads and verifies all knock packets from conn.
+//
+// It is self-contained: it reads packet 0's fixed header, recovers the nonce and
+// bucket, rejects a stale bucket and a replayed nonce (the replay window lives in
+// srvCtx.knockReplay), then recomputes the whole schedule and every body byte
+// from (secret, nonce, bucket) and checks them. The v1 version derived
+// everything from the secret alone, so a captured knock could be replayed
+// verbatim; here the nonce is single-use inside the window.
+func verifyFullKnockSequence(conn net.Conn, secret []byte, srvCtx *serverContext, logger *log.Logger) bool {
+	hdr := make([]byte, strategy.KnockHeaderLen)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		logger.Debug("Knock header read error: %v", err)
+		return false
+	}
+	if hdr[0] != 0x00 {
+		logger.Debug("Knock packet 0: wrong sequence number (got %d)", hdr[0])
+		return false
+	}
+
+	bucket := int64(binary.BigEndian.Uint64(hdr[1:9]))
+	if !strategy.KnockBucketFresh(bucket) {
+		logger.Debug("Knock bucket %d outside freshness window", bucket)
+		return false
+	}
+	nonce := append([]byte(nil), hdr[9:strategy.KnockHeaderLen]...)
+
+	if !srvCtx.knockReplay.checkAndRecord(nonce, knockReplayTTL) {
+		logger.Warn("Knock replay rejected (nonce seen inside the window)")
+		return false
+	}
+
+	seq := strategy.KnockScheduleFor(secret, nonce, bucket)
+	logger.Debug("Verifying knock sequence, packet sizes: %v", seq.Sizes)
+
+	// Packet 0 remainder: [tag:16][body0]. body0 length = size0 - header - tag.
+	rest0 := make([]byte, seq.Sizes[0]-strategy.KnockHeaderLen)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(conn, rest0); err != nil {
+		logger.Debug("Knock packet 0 body read error: %v", err)
+		return false
+	}
+	if !hmac.Equal(rest0[:strategy.KnockTagLen], strategy.KnockTag(secret, nonce, bucket)) {
+		logger.Debug("Knock packet 0: tag mismatch")
+		return false
+	}
+	body0 := strategy.KnockBody(secret, nonce, bucket, 0, seq.Sizes[0]-strategy.KnockHeaderLen-strategy.KnockTagLen)
+	if !hmac.Equal(rest0[strategy.KnockTagLen:], body0) {
+		logger.Debug("Knock packet 0: body mismatch")
+		return false
+	}
+
+	for i := 1; i < strategy.KnockPackets; i++ {
+		buf := make([]byte, seq.Sizes[i])
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			logger.Debug("Knock packet %d read error: %v", i, err)
+			return false
+		}
+		if buf[0] != byte(i) {
+			logger.Debug("Knock packet %d: wrong sequence number (got %d, expected %d)", i, buf[0], i)
+			return false
+		}
+		if !hmac.Equal(buf[1:], strategy.KnockBody(secret, nonce, bucket, i, seq.Sizes[i]-1)) {
+			logger.Debug("Knock packet %d: body mismatch", i)
+			return false
+		}
+		logger.Debug("Knock packet %d: OK (%d bytes)", i, seq.Sizes[i])
+	}
+
+	return true
+}
+
+// detectConfusionMagic and the rest of the confusion admission path now live in
+// confusion_auth.go, where the parse and the marker check sit next to each
+// other. Splitting them was how the old detector ended up routing a connection
+// into the relay on the strength of two bytes.
+
+// authClockSkewGraceMinutes bounds how many 1-minute buckets on either side of
+// "now" verifyH2Auth/verifyMorphAuth accept, tolerating client/server clock
+// drift. REALITY tolerates roughly +-5 minutes via its own 5-minute bucket
+// scheme (internal/tls/reality_extension.go); matching that order of magnitude
+// here fixes clients whose clock drifts by more than the original 1 minute.
+const authClockSkewGraceMinutes int64 = 10
+
+// sessionBindingOrUnmatchable returns ekm unchanged when the connection has a
+// TLS session exporter, and fresh random keying material when it has none.
+//
+// exporterBindingKey fails on any connection that is not TLS - the plaintext
+// entry path in handleConnection routes a bare "MRPH" or HTTP/2 preface straight
+// into the morph and h2 handlers - and the handlers carried on with ekm == nil.
+// h.Write(nil) adds nothing to the HMAC, so the verifiers then accepted the
+// unbound pre-S22 token: one value per secret per minute, sent in the clear on
+// that path and replayable by anyone who saw it for the whole skew window.
+// No client of ours authenticates these transports without TLS.
+//
+// Random material rather than an early return: the token is still checked
+// against every bucket and fails the same way a wrong token does, so the peer
+// sees the existing failure response and its timing, not a new one.
+func sessionBindingOrUnmatchable(ekm []byte) []byte {
+	if len(ekm) > 0 {
+		return ekm
+	}
+	unmatchable := make([]byte, customtls.BindingExporterLen)
+	_, _ = rand.Read(unmatchable)
+	return unmatchable
+}
+
+// verifyH2Auth checks the HTTP/2 stego auth token. ekm is the TLS session
+// exporter this connection authenticates over; it is folded into the HMAC so a
+// token captured on another TLS session is rejected here (S22 session binding).
+// The client derives the matching token from the exporter of the same handshake
+// (internal/strategy/stego.go generateAuthTokenBound).
+func verifyH2Auth(apiKey, requestID string, secret, ekm []byte) bool {
+	ekm = sessionBindingOrUnmatchable(ekm)
+
+	// Decode hex values
+	apiKeyBytes := decodeHex(apiKey)
+	requestIDBytes := decodeHex(requestID)
+
+	if len(apiKeyBytes) < 16 || len(requestIDBytes) < 16 {
+		return false
+	}
+
+	// Reconstruct token
+	receivedToken := append(apiKeyBytes[:16], requestIDBytes[:16]...)
+
+	// Check timestamps in range [-authClockSkewGraceMinutes, +authClockSkewGraceMinutes]
+	// to handle clock skew (widened from the original +-1 minute, which rejected
+	// clients with more than ~60s of drift - see REALITY's +-5min bucket for the
+	// same tolerance class).
+	currentMinute := time.Now().Unix() / 60
+	for offset := -authClockSkewGraceMinutes; offset <= authClockSkewGraceMinutes; offset++ {
+		timestamp := make([]byte, 8)
+		binary.BigEndian.PutUint64(timestamp, uint64(currentMinute+offset))
+
+		h := hmac.New(sha256.New, secret)
+		h.Write(timestamp)
+		h.Write([]byte("http2-stego-auth"))
+		h.Write(ekm) // TLS-session binding; must match the client's exporter
+		expectedToken := h.Sum(nil)[:32]
+
+		if hmac.Equal(receivedToken, expectedToken) {
+			return true
+		}
+	}
+	return false
+}
+
+// verifyMorphAuth checks the Morph / WebSocket-Padded / Geneva auth token. ekm
+// is the TLS session exporter this connection authenticates over, folded into
+// the HMAC for S22 session binding (see verifyH2Auth).
+func verifyMorphAuth(receivedToken, secret, ekm []byte) bool {
+	ekm = sessionBindingOrUnmatchable(ekm)
+	if len(receivedToken) != 32 {
+		return false
+	}
+
+	// Check timestamps in range [-authClockSkewGraceMinutes, +authClockSkewGraceMinutes]
+	// to handle clock skew (widened from the original +-1 minute - prod measured
+	// 509 FAILED/7 OK over 7 days, traced to clients with clock drift beyond the
+	// old +-1min window; REALITY tolerates ~+-5min via its own bucket scheme).
+	currentMinute := time.Now().Unix() / 60
+	for offset := -authClockSkewGraceMinutes; offset <= authClockSkewGraceMinutes; offset++ {
+		timestamp := make([]byte, 8)
+		binary.BigEndian.PutUint64(timestamp, uint64(currentMinute+offset))
+
+		h := hmac.New(sha256.New, secret)
+		h.Write(timestamp)
+		h.Write([]byte("http2-stego-auth")) // Use same context as H2 Stego for consistency
+		h.Write(ekm)                        // TLS-session binding; must match the client's exporter
+		expectedToken := h.Sum(nil)[:32]
+
+		if hmac.Equal(receivedToken, expectedToken) {
+			return true
+		}
+	}
+	return false
+}
+
+func sendH2AuthAck(framer *http2.Framer, streamID uint32, secret []byte) {
+	var headerBuf bytes.Buffer
+	enc := hpack.NewEncoder(&headerBuf)
+
+	enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+	enc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/grpc"})
+
+	// Bind the ack to a fresh per-connection nonce: value = hex(nonce || proof).
+	// deriveKey(secret,"server-ack") produced one static proof for the whole
+	// life of the secret, replayable across connections; the client verifies
+	// this format in stego.go verifyServerAckHeaders.
+	var ackNonce [stegoAckNonceLen]byte
+	if _, err := rand.Read(ackNonce[:]); err != nil {
+		return
+	}
+	ackVal := make([]byte, 0, stegoAckNonceLen+16)
+	ackVal = append(ackVal, ackNonce[:]...)
+	ackVal = append(ackVal, serverAckProof(secret, ackNonce[:])[:16]...)
+	enc.WriteField(hpack.HeaderField{
+		Name:  "x-goog-correlation-id",
+		Value: encodeHex(ackVal),
+	})
+
+	framer.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      streamID,
+		BlockFragment: headerBuf.Bytes(),
+		EndStream:     false,
+		EndHeaders:    true,
+	})
+}
+
+func deriveKey(secret []byte, context string) []byte {
+	h := hmac.New(sha256.New, secret)
+	h.Write([]byte(context))
+	return h.Sum(nil)
+}
+
+// stegoAckNonceLen is the per-connection nonce the server prefixes to its H2
+// stego ack proof. Must match strategy.stegoAckNonceLen (the client decoder).
+const stegoAckNonceLen = 8
+
+// serverAckProof derives the H2 stego ack proof from the secret and a
+// per-connection nonce, so the proof differs between connections instead of
+// being a single static value. Must match strategy.serverAckMaterial.
+func serverAckProof(secret, nonce []byte) []byte {
+	h := hmac.New(sha256.New, secret)
+	h.Write(nonce)
+	h.Write([]byte("server-ack"))
+	return h.Sum(nil)
+}
+
+func decodeHex(s string) []byte {
+	if len(s)%2 != 0 {
+		return nil
+	}
+	result := make([]byte, len(s)/2)
+	for i := 0; i < len(s); i += 2 {
+		var b byte
+		fmt.Sscanf(s[i:i+2], "%02x", &b)
+		result[i/2] = b
+	}
+	return result
+}
+
+func encodeHex(data []byte) string {
+	result := make([]byte, len(data)*2)
+	for i, b := range data {
+		result[i*2] = "0123456789abcdef"[b>>4]
+		result[i*2+1] = "0123456789abcdef"[b&0x0f]
+	}
+	return string(result)
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// bufferedConn wraps a connection with buffered data
+type bufferedConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (bc *bufferedConn) Read(p []byte) (int, error) {
+	return bc.reader.Read(p)
+}
+
+// Unwrap returns the connection this one buffers, so a caller can reach the
+// *tls.Conn underneath and read the handshake result off it. It deliberately
+// does not forward ConnectionState: a bufferedConn that claimed to be a TLS
+// connection would be handed to code that then reads bytes past the replay
+// buffer straight off the socket.
+func (bc *bufferedConn) Unwrap() net.Conn { return bc.Conn }
+
+// Ensure interface compliance
+var _ net.Conn = (*bufferedConn)(nil)
+
+// detectWebSocketPadded detects a WebSocket Padded upgrade by the keyed
+// X-Auth-Token it carries, not by any product-named header. X-Auth-Token is the
+// per-client HMAC the handler verifies below; keying detection off it means the
+// only header we look for is one whose value is a proof of the secret, and its
+// name is a common API convention rather than a self-report like the old
+// X-Salamander-Version.
+func detectWebSocketPadded(data []byte) bool {
+	return bytes.Contains(data, []byte("GET ")) &&
+		bytes.Contains(data, []byte("Upgrade: websocket")) &&
+		bytes.Contains(data, []byte("X-Auth-Token:"))
+}
+
+// handleWebSocketConnection handles WebSocket connection with ALPN routing
+// This is the kTLS-compatible entry point for tired-ws ALPN
+func handleWebSocketConnection(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
+	handleWebSocketPadded(conn, srvCtx, logger)
+}
+
+// handleWebSocketPadded handles a WebSocket Padded connection
+func handleWebSocketPadded(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
+	defer conn.Close()
+
+	logger.Debug("WebSocket Padded: Processing connection from %s", conn.RemoteAddr())
+
+	// Session binding (S22): the WebSocket-Padded and Geneva clients both bind
+	// their X-Auth-Token to this TLS session's exporter. kTLS offload happens
+	// after auth, so conn is still a userspace *tls.Conn here. WS has no
+	// plaintext entry path, so the exporter is always available.
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("WebSocket Padded: exporter unavailable: %v", ekmErr)
+	}
+
+	// Read upgrade request byte-exactly so no bytes past \r\n\r\n are
+	// consumed into an internal buffer. bufio.NewReader would pre-fetch
+	// past the empty line and lose those bytes when kTLS takes over.
+	_, headers, err := readHTTPRequestExact(conn, 8192)
+	if err != nil {
+		logger.Error("WebSocket Padded: Failed to read upgrade request: %v", err)
+		return
+	}
+
+	// Verify required headers
+	wsKey, hasKey := headers["Sec-WebSocket-Key"]
+	if !hasKey {
+		logger.Error("WebSocket Padded: Missing Sec-WebSocket-Key")
+		return
+	}
+
+	// The keyed X-Auth-Token is the sole discriminator and the authentication.
+	// There is no product-named header to require and no tokenless fallback: a
+	// 1.11.0 client always sends the token, so anything without one is not ours
+	// and gets a fast rejection rather than a guessed global-secret session.
+	authTokenHex, hasAuthToken := headers["X-Auth-Token"]
+	if !hasAuthToken {
+		logger.Error("WebSocket Padded: Missing X-Auth-Token")
+		return
+	}
+
+	authToken, err := hex.DecodeString(authTokenHex)
+	if err != nil {
+		logger.Error("WebSocket Padded: Invalid X-Auth-Token format: %v", err)
+		return
+	}
+
+	var usedSecret []byte
+	var clientID clientIdentity
+
+	// 1. Try per-client secrets from registry
+	if srvCtx.registry != nil {
+		clients := srvCtx.registry.ListClients()
+		for _, client := range clients {
+			if verifyMorphAuth(authToken, []byte(client.Secret), ekm) {
+				logger.Info("WebSocket Padded authenticated (client: %s, id: %s)", client.Name, client.ID)
+				usedSecret = []byte(client.Secret)
+				clientID = registryIdentity(client.ID)
+				break
+			}
+		}
+	}
+
+	// 2. Fallback to global secret
+	if usedSecret == nil && len(srvCtx.cfg.Secret) > 0 {
+		if verifyMorphAuth(authToken, srvCtx.cfg.Secret, ekm) {
+			logger.Info("WebSocket Padded authenticated (global secret)")
+			usedSecret = srvCtx.cfg.Secret
+			clientID = sharedIdentity(globalClientID)
+		}
+	}
+
+	if usedSecret == nil {
+		logger.Error("WebSocket Padded: Authentication failed - invalid token")
+		return
+	}
+
+	logger.Debug("WebSocket Padded: Valid upgrade request, key=%s, clientID=%s", wsKey, clientID)
+
+	// Compute WebSocket accept key
+	acceptKey := computeWebSocketAccept(wsKey)
+
+	// Send 101 Switching Protocols response
+	response := fmt.Sprintf(
+		"HTTP/1.1 101 Switching Protocols\r\n"+
+			"Upgrade: websocket\r\n"+
+			"Connection: Upgrade\r\n"+
+			"Sec-WebSocket-Accept: %s\r\n"+
+			"\r\n", acceptKey)
+
+	if _, err := conn.Write([]byte(response)); err != nil {
+		logger.Error("WebSocket Padded: Failed to send 101 response: %v", err)
+		return
+	}
+
+	logger.Info("WebSocket Padded: Upgrade complete for %s (client: %s)", conn.RemoteAddr(), clientID)
+
+	// Auth + upgrade complete: hand the socket over to kTLS for the
+	// frame-relay phase. readHTTPRequestExact stopped at \r\n\r\n with no
+	// over-read, and the upgrade response was written synchronously to
+	// the kernel send buffer.
+	preSwap := conn
+	conn = ktls.TryEnable(conn, "tired-ws")
+	if conn != preSwap && srvCtx.registry != nil && clientID.id != "" {
+		srvCtx.registry.SwapConn(clientID.id, preSwap, conn)
+	}
+
+	// Wrap with SalamanderConn using the authenticated secret
+	padder := padding.NewSalamanderPadder(usedSecret, padding.Balanced)
+	salamanderConn := strategy.NewSalamanderConn(conn, padder, false)
+
+	// Handle as raw tunnel
+	handleRawTunnel(salamanderConn, srvCtx, logger, clientID)
+}
+
+// computeWebSocketAccept computes the Sec-WebSocket-Accept header value
+func computeWebSocketAccept(key string) string {
+	const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+	h := sha256.New()
+	h.Write([]byte(key + websocketGUID))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+// ==================== HTTP Polling (meek-style) Transport ====================
+// This transport uses multiple short-lived HTTP/1.1 requests to tunnel data.
+// Each request is independent - no long-lived connections.
+// This evades DPI that throttles persistent connections (like Russian TSPU).
+
+// HTTPPollingSession represents a single polling session
+type HTTPPollingSession struct {
+	ID         string
+	ClientID   clientIdentity
+	Origin     string // Peer host of the request that opened the session
+	Secret     []byte
+	Created    time.Time
+	LastActive time.Time
+
+	// Bidirectional buffers
+	toClient   *bytes.Buffer // Data from target to client
+	fromClient *bytes.Buffer // Data from client to target
+	bufLock    sync.Mutex
+
+	// Acknowledgement tracking for reliable delivery
+	sentOffset   int64     // Total bytes sent to client (before ack)
+	ackOffset    int64     // Bytes acknowledged by client
+	unackedBuf   []byte    // Sliding window of sent but unacked data
+	lastSendTime time.Time // Time of last send (for re-send grace period)
+
+	// Target connection (established on first data)
+	targetConn net.Conn
+	targetLock sync.Mutex
+
+	// Lifecycle. closed is read without a lock by the relay loops and the TUN
+	// writer, so it is atomic; closeLock serialises Close itself.
+	closed    atomic.Bool
+	closeLock sync.Mutex
+}
+
+// HTTPPollingManager manages all polling sessions
+type HTTPPollingManager struct {
+	sessions map[string]*HTTPPollingSession
+	mu       sync.RWMutex
+
+	// Cleanup interval
+	cleanupInterval time.Duration
+	sessionTimeout  time.Duration
+}
+
+// Global polling manager
+var pollingManager = &HTTPPollingManager{
+	sessions:        make(map[string]*HTTPPollingSession),
+	cleanupInterval: 30 * time.Second,
+	sessionTimeout:  5 * time.Minute,
+}
+
+// init starts the polling manager cleanup routine
+func init() {
+	go pollingManager.cleanupLoop()
+}
+
+// cleanupLoop removes stale sessions
+func (pm *HTTPPollingManager) cleanupLoop() {
+	ticker := time.NewTicker(pm.cleanupInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		pm.cleanup()
+	}
+}
+
+// cleanup removes sessions that haven't been active
+func (pm *HTTPPollingManager) cleanup() {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	now := time.Now()
+	for id, sess := range pm.sessions {
+		if now.Sub(sess.LastActive) > pm.sessionTimeout {
+			log.Debug("HTTP Polling: Cleaning up stale session %s", id[:8])
+			sess.Close()
+			delete(pm.sessions, id)
+		}
+	}
+}
+
+// GetOrCreate gets or creates a session
+func (pm *HTTPPollingManager) GetOrCreate(sessionID string, secret []byte, clientID clientIdentity, origin string) (*HTTPPollingSession, bool) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	if sess, exists := pm.sessions[sessionID]; exists {
+		sess.LastActive = time.Now()
+		return sess, false
+	}
+
+	// Create new session
+	sess := &HTTPPollingSession{
+		ID:         sessionID,
+		ClientID:   clientID,
+		Origin:     origin,
+		Secret:     secret,
+		Created:    time.Now(),
+		LastActive: time.Now(),
+		toClient:   bytes.NewBuffer(nil),
+		fromClient: bytes.NewBuffer(nil),
+	}
+	pm.sessions[sessionID] = sess
+	return sess, true
+}
+
+// Get retrieves a session
+func (pm *HTTPPollingManager) Get(sessionID string) *HTTPPollingSession {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return pm.sessions[sessionID]
+}
+
+// Remove removes a session
+func (pm *HTTPPollingManager) Remove(sessionID string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	if sess, exists := pm.sessions[sessionID]; exists {
+		sess.Close()
+		delete(pm.sessions, sessionID)
+	}
+}
+
+// Close closes the session and its target connection
+func (s *HTTPPollingSession) Close() {
+	s.closeLock.Lock()
+	defer s.closeLock.Unlock()
+
+	if s.closed.Load() {
+		return
+	}
+	s.closed.Store(true)
+
+	s.targetLock.Lock()
+	if s.targetConn != nil {
+		s.targetConn.Close()
+	}
+	s.targetLock.Unlock()
+}
+
+// WriteToClient writes data to be sent to client on next poll
+func (s *HTTPPollingSession) WriteToClient(data []byte) {
+	s.bufLock.Lock()
+	defer s.bufLock.Unlock()
+	s.toClient.Write(data)
+}
+
+// The uplink (client -> server bytes) has exactly one writer and one reader:
+//
+//   - writer: processHTTPPollingRequest, which appends each request body with
+//     WriteFromClient in the order the bodies arrive;
+//   - reader: the session's relay goroutine (runPollingSessionRelay, then
+//     runPollingTUNMode or the SOCKS client->target loop), which takes
+//     everything with ReadFromClient.
+//
+// The reader keeps whatever it cannot use yet (a frame whose tail is still in
+// flight, the rest of a body after the SOCKS target address) to itself. It used
+// to write that tail back with WriteFromClient, which put it BEHIND any body
+// that had arrived while it was parsing - the stream came out reordered and the
+// TUN parser read a garbage length and closed the session. ReadFromClient also
+// handed out a slice that still pointed into the buffer, so the next body was
+// written over bytes the reader was still parsing, or still writing to the
+// SOCKS target.
+
+// ReadFromClient takes every byte received from the client so far. The slice is
+// the caller's: nothing in the session refers to it afterwards.
+func (s *HTTPPollingSession) ReadFromClient() []byte {
+	s.bufLock.Lock()
+	defer s.bufLock.Unlock()
+	if s.fromClient.Len() == 0 {
+		return nil
+	}
+	data := s.fromClient.Bytes()
+	s.fromClient = bytes.NewBuffer(nil) // hand the old array over; never write it again
+	return data
+}
+
+// maxFromClientBuffered bounds the uplink a stuck reader can leave behind.
+// Legitimate traffic never approaches it: the reader drains every ~10ms and the
+// client uploads at most 8 KiB per request.
+const maxFromClientBuffered = 4 * 1024 * 1024
+
+// WriteFromClient appends one request body to the uplink, or refuses it whole
+// when that would take the uplink over maxFromClientBuffered. A refused body
+// is not lost: the caller answers the request with an error, and the client
+// keeps the bytes and sends them again (see processHTTPPollingRequest).
+// Dropping it silently, as this used to, leaves a hole in a byte stream that
+// nothing can repair.
+func (s *HTTPPollingSession) WriteFromClient(data []byte) bool {
+	s.bufLock.Lock()
+	defer s.bufLock.Unlock()
+	if s.fromClient.Len()+len(data) > maxFromClientBuffered {
+		return false
+	}
+	s.fromClient.Write(data)
+	return true
+}
+
+// ReadToClient reads data to send to client with acknowledgement-based reliability
+// ackSeq is the total bytes the client has successfully received
+func (s *HTTPPollingSession) ReadToClient(ackSeq int64) []byte {
+	s.bufLock.Lock()
+	defer s.bufLock.Unlock()
+
+	const maxChunk = 16 * 1024 // 16KB max per response
+
+	// Process acknowledgement - remove acked data from unacked buffer
+	if ackSeq > s.ackOffset {
+		bytesAcked := ackSeq - s.ackOffset
+		if int(bytesAcked) <= len(s.unackedBuf) {
+			// Remove acknowledged data from unacked buffer
+			s.unackedBuf = s.unackedBuf[bytesAcked:]
+			s.ackOffset = ackSeq
+		} else {
+			// Client acked more than we have in unacked buffer - reset
+			s.unackedBuf = nil
+			s.ackOffset = ackSeq
+		}
+	}
+
+	// Check if we need to re-send unacked data (with grace period to allow parallel polls to ack)
+	// Only re-send if: we have unacked data, client is behind, AND enough time has passed
+	const resendGracePeriod = 500 * time.Millisecond // Wait before triggering re-send
+	if len(s.unackedBuf) > 0 && ackSeq < s.sentOffset && time.Since(s.lastSendTime) > resendGracePeriod {
+		// Client hasn't received all data after grace period - re-send from where client is
+		resendOffset := ackSeq - (s.sentOffset - int64(len(s.unackedBuf)))
+		if resendOffset >= 0 && resendOffset < int64(len(s.unackedBuf)) {
+			// Re-send from resendOffset
+			toResend := s.unackedBuf[resendOffset:]
+			if len(toResend) > maxChunk {
+				toResend = toResend[:maxChunk]
+			}
+			s.lastSendTime = time.Now() // Update send time for re-send
+			return toResend
+		}
+	}
+
+	// Flow control: don't send more data if unacked buffer is full
+	const maxUnackedSize = 2 * 1024 * 1024 // 2MB max unacked data
+	if len(s.unackedBuf) > maxUnackedSize {
+		// Wait for acks before sending more
+		return nil
+	}
+
+	// Get new data from buffer
+	data := s.toClient.Bytes()
+	if len(data) == 0 {
+		return nil
+	}
+
+	// Limit chunk size
+	chunk := data
+	if len(chunk) > maxChunk {
+		chunk = data[:maxChunk]
+	}
+
+	// Copy chunk to return (don't modify original slice)
+	result := make([]byte, len(chunk))
+	copy(result, chunk)
+
+	// Move data to unacked buffer (keep for potential re-send)
+	s.unackedBuf = append(s.unackedBuf, chunk...)
+	s.sentOffset += int64(len(chunk))
+	s.lastSendTime = time.Now() // Track send time for re-send grace period
+
+	// Remove sent data from toClient buffer
+	remaining := data[len(chunk):]
+	s.toClient.Reset()
+	if len(remaining) > 0 {
+		s.toClient.Write(remaining)
+	}
+
+	return result
+}
+
+// verifyPollingAuth verifies the HMAC auth token for polling requests. ekm is
+// the TLS session exporter of the connection the request arrived on, folded
+// into the HMAC for S22 session binding: a token captured on one poll session
+// is rejected on any other. Keep-alive reuses one TLS session, so its exporter
+// is stable across the burst of requests and the token keeps verifying; a fresh
+// dial gets a fresh exporter and the client rederives the token to match (see
+// internal/strategy/http_polling.go generateAuthTokenForConn).
+func verifyPollingAuth(authToken, sessionID string, secret, ekm []byte) bool {
+	// Auth token is generated as: HMAC(secret, sessionID:timestamp || ekm)[:16]
+	// We allow tokens from last 60 seconds
+	ekm = sessionBindingOrUnmatchable(ekm)
+	now := time.Now().Unix()
+
+	for delta := int64(0); delta <= 60; delta++ {
+		data := fmt.Sprintf("%s:%d", sessionID, now-delta)
+		h := hmac.New(sha256.New, secret)
+		h.Write([]byte(data))
+		h.Write(ekm) // TLS-session binding; must match the client's exporter
+		expected := base64.StdEncoding.EncodeToString(h.Sum(nil))[:16]
+		if hmac.Equal([]byte(authToken), []byte(expected)) {
+			return true
+		}
+	}
+	return false
+}
+
+// decodeClientSecret decodes a client secret from hex string to binary bytes
+// Redis stores secrets as 64-char hex strings, but auth uses binary bytes
+func decodeClientSecret(secretStr string) []byte {
+	// If it looks like hex (64 chars, all hex digits), decode it
+	if len(secretStr) == 64 {
+		decoded, err := hex.DecodeString(secretStr)
+		if err == nil {
+			return decoded
+		}
+	}
+	// Fall back to raw bytes (for backwards compatibility)
+	return []byte(secretStr)
+}
+
+// pollingUplinkCommitBudget is how long a request body may take to arrive,
+// counted from its header block, and still be written into the session.
+//
+// The uplink carries no sequence number. The client gives every request 3s
+// (tlsConn.SetDeadline in internal/strategy/http_polling.go exchange), and on
+// any error it puts the body back at the front of its send buffer and sends it
+// again on a fresh connection. A body that reaches the server after the client
+// gave up is therefore a copy of bytes that are already on their way again:
+// writing it duplicates them, and in TUN mode the frame parser then reads a
+// garbage length and closes the session. On a lossy path this is a slow body
+// read (seen on a 300ms/2%-loss stand: the abandoned body finished 2.3s and
+// 4.5s after its headers). A refusal is always safe - a client still waiting
+// re-sends, one that left never reads the answer - so the budget is set well
+// inside the client's 3s, leaving room for the headers' own delay and for the
+// response's way back. What it cannot catch is a body that arrived in time
+// whose response is then lost past the client's deadline; only an uplink
+// sequence number in the protocol closes that.
+const pollingUplinkCommitBudget = time.Second
+
+// pollingServerMaxRequests / pollingServerKeepaliveIdle bound connection reuse
+// on the server side. They mirror the client's bounds: reuse amortises the TLS
+// handshake across a burst of active polls, but a meek connection is never held
+// open indefinitely (TSPU throttles long-lived flows). Past the request count,
+// or if the next keep-alive request does not arrive within the idle window, the
+// server closes and the client dials afresh.
+const (
+	pollingServerMaxRequests   = 64
+	pollingServerKeepaliveIdle = 15 * time.Second
+)
+
+// handleHTTPPollingWithALPN handles HTTP polling connections via ALPN routing
+// This is the kTLS-compatible entry point for tired-polling ALPN
+func handleHTTPPollingWithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
+	// Read the first HTTP request
+	buf := make([]byte, 4096)
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	n, err := conn.Read(buf)
+	conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		logger.Debug("HTTP Polling (ALPN): Failed to read request: %v", err)
+		conn.Close()
+		return
+	}
+
+	logger.Debug("HTTP Polling (ALPN): Received %d bytes", n)
+	handleHTTPPolling(conn, srvCtx, buf[:n], logger)
+}
+
+// handleHTTPPolling serves HTTP polling requests on one connection, looping for
+// keep-alive so a client can amortise the TLS handshake across a burst of polls.
+// firstRequest is whatever the caller already read off the socket; the rest is
+// pulled from conn through a single persistent reader so the stream stays
+// aligned across requests.
+func handleHTTPPolling(conn net.Conn, srvCtx *serverContext, firstRequest []byte, logger *log.Logger) {
+	defer conn.Close()
+	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(firstRequest), conn))
+
+	// Session binding (S22): every request on this connection authenticates
+	// against the same TLS session exporter. Keep-alive reuses one *tls.Conn for
+	// the whole burst, so the exporter is constant across the loop and the
+	// client's per-request token keeps verifying. Polling has no plaintext entry
+	// path, so the exporter is available.
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("HTTP Polling: exporter unavailable: %v", ekmErr)
+	}
+
+	for i := 0; i < pollingServerMaxRequests; i++ {
+		if i > 0 {
+			// Wait a bounded time for the next keep-alive request.
+			conn.SetReadDeadline(time.Now().Add(pollingServerKeepaliveIdle))
+		}
+		head, err := readPollingRequestHead(reader)
+		conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			// Client closed the connection or went idle past the window - normal
+			// end of a keep-alive burst, not an error worth logging loudly.
+			if i == 0 {
+				logger.Debug("HTTP Polling: failed to read request head: %v", err)
+			}
+			return
+		}
+		if !processHTTPPollingRequest(conn, reader, srvCtx, head, ekm, logger) {
+			return
+		}
+	}
+}
+
+// readPollingRequestHead reads one HTTP request's header block (up to and
+// including the terminating blank line) from reader.
+func readPollingRequestHead(reader *bufio.Reader) ([]byte, error) {
+	var head []byte
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return nil, err
+		}
+		head = append(head, line...)
+		if len(head) > 16*1024 {
+			return nil, errors.New("polling request head too large")
+		}
+		if bytes.Equal(line, []byte("\r\n")) || bytes.Equal(line, []byte("\n")) {
+			return head, nil
+		}
+	}
+}
+
+// processHTTPPollingRequest processes a single HTTP polling request and reports
+// whether the client asked to keep the connection open for a further request.
+func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serverContext, request, ekm []byte, logger *log.Logger) (keepAliveOut bool) {
+	headAt := time.Now() // the header block is in; the body, if any, follows
+	// Parse headers from request
+	lines := bytes.Split(request, []byte("\r\n"))
+	var sessionID, authToken string
+	var contentLength int
+	var ackSeq int64
+	keepAlive := false
+
+	for _, line := range lines {
+		if bytes.HasPrefix(line, []byte("X-Session-ID:")) {
+			sessionID = strings.TrimSpace(string(line[13:]))
+		}
+		if bytes.HasPrefix(line, []byte("X-Auth-Token:")) {
+			authToken = strings.TrimSpace(string(line[13:]))
+		}
+		if bytes.HasPrefix(line, []byte("X-Ack:")) {
+			fmt.Sscanf(string(line), "X-Ack: %d", &ackSeq)
+		}
+		if bytes.HasPrefix(line, []byte("Content-Length:")) {
+			fmt.Sscanf(string(line), "Content-Length: %d", &contentLength)
+		}
+		if bytes.HasPrefix(bytes.ToLower(line), []byte("connection:")) && bytes.Contains(bytes.ToLower(line), []byte("keep-alive")) {
+			keepAlive = true
+		}
+	}
+
+	if sessionID == "" {
+		logger.Debug("HTTP Polling: Missing session ID")
+		sendHTTPPollingError(conn, "Missing session ID")
+		return false
+	}
+
+	// Read body if present. request is the header block only; the body follows on
+	// the persistent reader (which spans keep-alive requests), so read exactly
+	// contentLength bytes to keep the stream aligned for the next request.
+	var body []byte
+	if contentLength > 0 {
+		body = make([]byte, contentLength)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, err := io.ReadFull(reader, body)
+		conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			logger.Debug("HTTP Polling: Failed to read body: %v", err)
+			sendHTTPPollingError(conn, "Failed to read body")
+			return false
+		}
+	}
+
+	// A body that took too long to arrive may belong to a request the client
+	// has already given up on (see pollingUplinkCommitBudget); it is refused
+	// below instead of written.
+	late := len(body) > 0 && time.Since(headAt) > pollingUplinkCommitBudget
+
+	// Check if session already exists - if so, use its secret for auth
+	existingSess := pollingManager.Get(sessionID)
+
+	var usedSecret []byte
+	var clientID clientIdentity
+
+	if existingSess != nil {
+		// Session exists - verify auth against session's secret
+		if verifyPollingAuth(authToken, sessionID, existingSess.Secret, ekm) {
+			usedSecret = existingSess.Secret
+			clientID = existingSess.ClientID
+		} else {
+			// Debug: try all secrets to find which one would match
+			logger.Debug("HTTP Polling: Auth failed for existing session %s (token mismatch)", sessionID[:8])
+
+			// Try registered clients to see if any match
+			if srvCtx.registry != nil {
+				clients := srvCtx.registry.ListClients()
+				for _, c := range clients {
+					secretBytes := []byte(c.Secret)
+					if verifyPollingAuth(authToken, sessionID, secretBytes, ekm) {
+						logger.Debug("HTTP Polling: Token would match client '%s'", c.Name)
+					}
+				}
+			}
+			if verifyPollingAuth(authToken, sessionID, srvCtx.cfg.Secret, ekm) {
+				logger.Debug("HTTP Polling: Token would match global secret")
+			}
+
+			sendHTTPPollingError(conn, "Authentication failed")
+			return false
+		}
+	} else {
+		// New session - authenticate by trying registered clients, then global secret
+		if srvCtx.registry != nil {
+			clients := srvCtx.registry.ListClients()
+			for _, c := range clients {
+				// Use secret as-is (client uses ASCII bytes of hex string)
+				secretBytes := []byte(c.Secret)
+				if verifyPollingAuth(authToken, sessionID, secretBytes, ekm) {
+					usedSecret = secretBytes
+					clientID = registryIdentity(c.ID)
+					logger.Debug("HTTP Polling: Auth matched client '%s' (id=%s)", c.Name, c.ID)
+					break
+				}
+			}
+		}
+
+		if usedSecret == nil && len(srvCtx.cfg.Secret) > 0 {
+			if verifyPollingAuth(authToken, sessionID, srvCtx.cfg.Secret, ekm) {
+				usedSecret = srvCtx.cfg.Secret
+				clientID = sharedIdentity(globalClientID)
+				logger.Debug("HTTP Polling: Auth matched global secret")
+			}
+		}
+
+		if usedSecret == nil {
+			logger.Debug("HTTP Polling: Authentication failed for new session %s", sessionID[:8])
+			sendHTTPPollingError(conn, "Authentication failed")
+			return false
+		}
+	}
+
+	// Get or create session
+	sess, isNew := pollingManager.GetOrCreate(sessionID, usedSecret, clientID, originOf(conn.RemoteAddr()))
+
+	if isNew {
+		logger.Info("HTTP Polling: New session %s (client: %s), body=%d bytes, contentLength=%d", sessionID[:8], clientID, len(body), contentLength)
+
+		// Write init body data (contains target address) BEFORE starting relay.
+		// The session is empty, so only a body over the whole bound is refused;
+		// no relay will ever read this session, so it goes with the body.
+		if len(body) > 0 {
+			if late || !sess.WriteFromClient(body) {
+				logger.Debug("HTTP Polling: New session %s body of %d bytes refused (late=%v)", sessionID[:8], len(body), late)
+				pollingManager.Remove(sessionID)
+				sendHTTPPollingBusy(conn)
+				return false
+			}
+			logger.Debug("HTTP Polling: New session received %d bytes (target addr): %x", len(body), body)
+		} else {
+			logger.Debug("HTTP Polling: WARNING - New session has no body data!")
+		}
+
+		// Send OK for new session
+		sendHTTPPollingResponse(conn, []byte("OK"), keepAlive)
+
+		// Start background relay goroutine for this session
+		go runPollingSessionRelay(sess, srvCtx, logger)
+		return keepAlive
+	}
+
+	// Existing session - exchange data
+	sess.LastActive = time.Now()
+
+	// Write client data to session buffer
+	if len(body) > 0 {
+		if late {
+			logger.Debug("HTTP Polling: body of %d bytes took %v (session %s), refusing it as possibly abandoned",
+				len(body), time.Since(headAt).Round(time.Millisecond), sessionID[:8])
+			sendHTTPPollingBusy(conn)
+			return false
+		}
+		if !sess.WriteFromClient(body) {
+			// The relay is not keeping up. Refuse the body instead of dropping
+			// it: a non-200 makes the client keep these bytes, drop the
+			// connection and send them again after its backoff, so the stream
+			// stays whole and the backlog stays bounded. No downlink data and no
+			// ack are processed for this request; the next one carries both.
+			logger.Debug("HTTP Polling: uplink full (session %s), refusing %d bytes", sessionID[:8], len(body))
+			sendHTTPPollingBusy(conn)
+			return false
+		}
+		logger.Debug("HTTP Polling: Received %d bytes from client (session %s)", len(body), sessionID[:8])
+	}
+
+	// Get data for client (with acknowledgement tracking)
+	toClient := sess.ReadToClient(ackSeq)
+	if len(toClient) > 0 {
+		logger.Debug("HTTP Polling: Sending %d bytes to client (session %s, ack=%d)", len(toClient), sessionID[:8], ackSeq)
+	}
+
+	sendHTTPPollingResponse(conn, toClient, keepAlive)
+	return keepAlive
+}
+
+// runPollingSessionRelay handles the relay for a polling session
+func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, logger *log.Logger) {
+	logger.Debug("HTTP Polling: Starting relay for session %s", sess.ID[:8])
+
+	// Wait for first data from client to determine target. This goroutine is
+	// the uplink's only reader from here on: what it takes but cannot use yet
+	// stays in head and is handed on, never written back into the session.
+	var targetAddr string
+	var head []byte // uplink bytes taken but not consumed yet
+	timeout := time.After(30 * time.Second)
+
+	for {
+		select {
+		case <-timeout:
+			logger.Debug("HTTP Polling: Session %s timed out waiting for target", sess.ID[:8])
+			pollingManager.Remove(sess.ID)
+			return
+		default:
+		}
+
+		if fresh := sess.ReadFromClient(); len(fresh) > 0 {
+			head = append(head, fresh...)
+		}
+		if len(head) > 0 {
+			// Check for TUN mode (first byte = 0x02)
+			if head[0] == 0x02 {
+				logger.Info("HTTP Polling: TUN mode detected for session %s", sess.ID[:8])
+				runPollingTUNMode(sess, head[1:], srvCtx, logger)
+				return
+			}
+
+			// SOCKS mode: First 2 bytes are address length
+			if len(head) >= 2 {
+				addrLen := int(head[0])<<8 | int(head[1])
+				if addrLen < 3 || addrLen > 256 {
+					logger.Debug("HTTP Polling: Invalid address (len=%d, have=%d)", addrLen, len(head))
+					pollingManager.Remove(sess.ID)
+					return
+				}
+				if len(head) >= 2+addrLen {
+					targetAddr = string(head[2 : 2+addrLen])
+					head = head[2+addrLen:] // the first payload bytes, written to the target first
+					break
+				}
+			}
+			// The address is split across bodies: wait for the rest.
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	logger.Info("HTTP Polling: Session %s connecting to %s", sess.ID[:8], targetAddr)
+
+	// Connect to target
+	var targetConn net.Conn
+	var err error
+	if srvCtx.upstreamDialer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		cancel()
+	} else {
+		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
+	}
+
+	if err != nil {
+		logger.Warn("HTTP Polling: Failed to connect to %s: %v", targetAddr, err)
+		sess.WriteToClient([]byte{0x01}) // Failure
+		pollingManager.Remove(sess.ID)
+		return
+	}
+
+	sess.targetLock.Lock()
+	sess.targetConn = targetConn
+	sess.targetLock.Unlock()
+
+	// Send success
+	sess.WriteToClient([]byte{0x00})
+	logger.Info("HTTP Polling: Session %s connected to %s", sess.ID[:8], targetAddr)
+
+	// Start bidirectional relay
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Client -> Target. The slices ReadFromClient returns belong to this
+	// goroutine, so a body arriving mid-write can no longer overwrite them.
+	go func() {
+		defer wg.Done()
+		if len(head) > 0 {
+			if _, err := targetConn.Write(head); err != nil {
+				return
+			}
+			head = nil
+		}
+		for {
+			if sess.closed.Load() {
+				return
+			}
+			data := sess.ReadFromClient()
+			if len(data) > 0 {
+				if _, err := targetConn.Write(data); err != nil {
+					return
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	// Target -> Client
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 32*1024)
+		for {
+			targetConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, err := targetConn.Read(buf)
+			if n > 0 {
+				sess.WriteToClient(buf[:n])
+			}
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					if sess.closed.Load() {
+						return
+					}
+					continue
+				}
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	logger.Info("HTTP Polling: Session %s relay ended", sess.ID[:8])
+	pollingManager.Remove(sess.ID)
+}
+
+// sendHTTPPollingResponse sends HTTP 200 OK with body (Keep-Alive)
+func sendHTTPPollingResponse(conn net.Conn, body []byte, keepAlive bool) {
+	connection := "close"
+	if keepAlive {
+		connection = "keep-alive"
+	}
+	response := fmt.Sprintf(
+		"HTTP/1.1 200 OK\r\n"+
+			"Content-Type: application/octet-stream\r\n"+
+			"Content-Length: %d\r\n"+
+			"Connection: %s\r\n"+
+			"\r\n", len(body), connection)
+
+	conn.Write([]byte(response))
+	if len(body) > 0 {
+		conn.Write(body)
+	}
+}
+
+// sendHTTPPollingBusy refuses a request whose body the session cannot take
+// yet. Any non-200 is an error to the client, which re-sends the body later.
+func sendHTTPPollingBusy(conn net.Conn) {
+	conn.Write([]byte("HTTP/1.1 503 Service Unavailable\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"Content-Length: 0\r\n" +
+		"Connection: close\r\n" +
+		"\r\n"))
+}
+
+// sendHTTPPollingError sends HTTP 400 error
+func sendHTTPPollingError(conn net.Conn, message string) {
+	response := fmt.Sprintf(
+		"HTTP/1.1 400 Bad Request\r\n"+
+			"Content-Type: text/plain\r\n"+
+			"Content-Length: %d\r\n"+
+			"Connection: close\r\n"+
+			"\r\n%s", len(message), message)
+
+	conn.Write([]byte(response))
+}
+
+// runPollingTUNMode handles TUN mode over HTTP Polling
+func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *serverContext, logger *log.Logger) {
+	cfg := srvCtx.cfg
+	logger.Debug("HTTP Polling TUN mode, remaining data: %d bytes", len(remainingData))
+
+	// Parse TUN handshake from remaining data: [localIP:4][mtu:2][version:1]
+	// Version byte is optional (v1 clients send 6 bytes, v2 clients send 7 bytes)
+	if len(remainingData) < 6 {
+		logger.Debug("HTTP Polling TUN handshake too short: %d bytes", len(remainingData))
+		sess.WriteToClient([]byte{0x01}) // Failure
+		pollingManager.Remove(sess.ID)
+		return
+	}
+
+	// A relay forwards this client upstream and never touches its own TUN, so
+	// only an exit needs the shared device here.
+	if srvCtx == nil || (srvCtx.sharedTUN == nil && srvCtx.upstreamDialer == nil) {
+		logger.Error("HTTP Polling TUN: Shared TUN not initialized")
+		sess.WriteToClient([]byte{0x01}) // Failure
+		pollingManager.Remove(sess.ID)
+		return
+	}
+
+	requestedIP := net.IP(remainingData[0:4])
+	clientID := sess.ClientID.prefixed("polling")
+	logger.Debug("HTTP Polling TUN: requestedIP=%s, clientID=%s", requestedIP, clientID)
+
+	// Check for version byte (v2 clients send 7 bytes total)
+	var clientVersion uint8 = 1 // Default to v1 for backwards compatibility
+	if len(remainingData) >= 7 {
+		clientVersion = remainingData[6]
+		logger.Debug("HTTP Polling TUN client requested: IP=%s, clientID=%s, version=%d", requestedIP, clientID, clientVersion)
+	} else {
+		logger.Debug("HTTP Polling TUN client requested: IP=%s, clientID=%s (legacy v1)", requestedIP, clientID)
+	}
+
+	// Create polling TUN connection adapter
+	pollConn := &pollingTUNConn{
+		sess:   sess,
+		closed: make(chan struct{}),
+	}
+	// One gate for every downstream write on this session: the handshake
+	// response, the dispatcher's frames, the keepalive echo, the relay pump.
+	// Without it a frame queued for this tunnel IP could reach the client ahead
+	// of the handshake response and desync the stream for good.
+	gate := newTunFrameGate(func(frame []byte) error {
+		if sess.closed.Load() {
+			return io.EOF
+		}
+		sess.WriteToClient(frame)
+		return nil
+	})
+	pollConn.gate = gate
+
+	var clientIP, serverIP net.IP
+	var sink tunPacketSink
+
+	if srvCtx.upstreamDialer != nil {
+		// Relay: forward to the upstream exit rather than terminating here. This
+		// is the path a client lands on after falling back to meek-style polling,
+		// which used to strand it on the relay's own exit and address pool.
+		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData, sess.Origin,
+			func(pkt []byte) error {
+				_, err := pollConn.Write(pkt)
+				return err
+			})
+		if err != nil {
+			logger.Warn("HTTP Polling TUN relay: upstream dial failed: %v", err)
+			sess.WriteToClient([]byte{0x01}) // Failure
+			pollingManager.Remove(sess.ID)
+			return
+		}
+		sink, serverIP, clientIP = relaySink, upServerIP, upClientIP
+		defer func() {
+			relaySink.Close()
+			pollingManager.Remove(sess.ID)
+			logger.Info("HTTP Polling TUN relay client disconnected: %s (clientID=%s)", clientIP, clientID)
+		}()
+	} else {
+		// Allocate IP from pool
+		if srvCtx.ipPool != nil {
+			allocatedIP, err := srvCtx.ipPool.Allocate(allocationKey(clientID, sess.Origin), requestedIP, "")
+			if err != nil {
+				logger.Error("HTTP Polling TUN: Failed to allocate IP from pool: %v", err)
+				sess.WriteToClient([]byte{0x01}) // Failure
+				pollingManager.Remove(sess.ID)
+				return
+			}
+			clientIP = allocatedIP
+			logger.Info("HTTP Polling TUN client: allocated IP=%s from pool (clientID=%s)", clientIP, clientID)
+		} else {
+			clientIP = requestedIP
+			logger.Info("HTTP Polling TUN client: IP=%s (no pool)", clientIP)
+		}
+		serverIP = cfg.TunIP
+
+		// Register client with shared TUN using custom framer for polling
+		// Polling uses [length:4][packet:N] framing
+		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, pollConn, nil, gate)
+		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
+		sink = localSink
+		defer func() {
+			localSink.Close()
+			pollingManager.Remove(sess.ID)
+			logger.Info("HTTP Polling TUN client disconnected: %s (clientID=%s)", clientIP, clientID)
+		}()
+	}
+
+	// Send success response: shared-constructor payload written to the polling
+	// buffer. Local exit: v6 addrs from our pool. Relay: v6 addrs assigned by
+	// the upstream exit (absent when the exit did not negotiate dual-stack).
+	dual := downstreamDualStackAddrs(sink, cfg.IPPoolV6, clientIP)
+	resp := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual)
+	recordDualStackSession(srvCtx, clientVersion, dual)
+	if err := gate.Open(resp); err != nil {
+		logger.Debug("HTTP Polling TUN handshake response write failed: %v", err)
+		return
+	}
+
+	logger.Info("HTTP Polling TUN mode established (client=%s, server=%s)", clientIP, serverIP)
+
+	// Main loop: Read from polling buffers -> TUN
+	// TUN -> Client is handled by SharedTUN packet dispatcher via pollConn.Write()
+	lenBuf := make([]byte, 4)
+	var packetsUp int64
+	var pending []byte // a frame's head whose tail has not arrived yet
+
+	for {
+		select {
+		case <-sink.Done():
+			logger.Debug("HTTP Polling TUN loop stopping (client replaced or upstream gone)")
+			return
+		case <-pollConn.closed:
+			logger.Debug("HTTP Polling TUN loop stopping (connection closed)")
+			return
+		default:
+		}
+
+		// Check if session is still active
+		if sess.closed.Load() {
+			logger.Debug("HTTP Polling TUN: session closed")
+			return
+		}
+
+		// Read packet from client via polling buffer. pending is the tail of a
+		// frame taken earlier; it is ours and goes in front of the new bytes.
+		fresh := sess.ReadFromClient()
+		if len(fresh) == 0 {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		data := fresh
+		if len(pending) > 0 {
+			data = append(pending, fresh...)
+		}
+		pending = nil
+
+		// Process packets from buffer
+		logger.Debug("HTTP Polling TUN: processing data, len=%d", len(data))
+		for len(data) >= 4 {
+			// Read length prefix
+			copy(lenBuf, data[:4])
+			pktLen := binary.BigEndian.Uint32(lenBuf)
+			logger.Debug("HTTP Polling TUN: read pktLen=%d", pktLen)
+
+			// Handle keepalive (zero length)
+			if pktLen == 0 {
+				data = data[4:]
+				logger.Debug("HTTP Polling TUN: echoing keepalive")
+				if err := gate.Frame([]byte{0, 0, 0, 0}); err != nil && !FrameDropped(err) {
+					logger.Debug("HTTP Polling TUN: keepalive echo failed: %v", err)
+				}
+				continue
+			}
+
+			// A length prefix over the max possible IP packet size is corrupt
+			// framing, not a partial read - the stream can never resync past it.
+			// Putting it back (like the incomplete-data case below) would just
+			// re-parse the same leading 4 bytes forever while every subsequent
+			// poll's body piles up behind it, unbounded. Tear the session down.
+			if pktLen > 65535 {
+				logger.Debug("HTTP Polling TUN: invalid packet length %d, closing session", pktLen)
+				sess.Close()
+				pollingManager.Remove(sess.ID)
+				return
+			}
+
+			if int(pktLen)+4 > len(data) {
+				// Genuinely incomplete - wait for the rest on the next poll.
+				logger.Debug("HTTP Polling TUN: incomplete packet, pktLen=%d, data=%d", pktLen, len(data))
+				break
+			}
+
+			// Extract IP packet
+			ipPkt := data[4 : 4+pktLen]
+			data = data[4+pktLen:]
+
+			// Validate IP packet
+			if len(ipPkt) < 20 {
+				logger.Debug("HTTP Polling TUN: packet too small: %d", len(ipPkt))
+				continue
+			}
+
+			if err := sink.WritePacket(ipPkt); err != nil {
+				logger.Debug("HTTP Polling TUN: sink write failed: %v", err)
+				continue
+			}
+			packetsUp++
+			sink.UpdateActivity()
+		}
+
+		// Keep the unparsed tail (less than one frame) for the next round. A
+		// copy, so the array of a large body is not pinned for one short tail.
+		if len(data) > 0 {
+			pending = append([]byte(nil), data...)
+		}
+	}
+}
+
+// pollingTUNConn adapts HTTP Polling session to net.Conn for SharedTUN
+type pollingTUNConn struct {
+	sess   *HTTPPollingSession
+	closed chan struct{}
+	gate   *tunFrameGate
+}
+
+func (c *pollingTUNConn) Read(b []byte) (int, error) {
+	// Not used - data comes via sess.ReadFromClient() in the main loop
+	return 0, io.EOF
+}
+
+func (c *pollingTUNConn) Write(b []byte) (int, error) {
+	// Write packet to client with length prefix
+	if c.sess.closed.Load() {
+		return 0, io.EOF
+	}
+	// Frame: [length:4][packet:N]
+	frame := make([]byte, 4+len(b))
+	binary.BigEndian.PutUint32(frame[0:4], uint32(len(b)))
+	copy(frame[4:], b)
+	if c.gate != nil {
+		if err := c.gate.Frame(frame); err != nil {
+			if FrameDropped(err) {
+				return len(b), nil // not attached yet; the inner TCP retransmits
+			}
+			return 0, err
+		}
+		return len(b), nil
+	}
+	c.sess.WriteToClient(frame)
+	return len(b), nil
+}
+
+func (c *pollingTUNConn) Close() error {
+	select {
+	case <-c.closed:
+	default:
+		close(c.closed)
+	}
+	return nil
+}
+
+func (c *pollingTUNConn) LocalAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+}
+
+func (c *pollingTUNConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+}
+
+func (c *pollingTUNConn) SetDeadline(t time.Time) error      { return nil }
+func (c *pollingTUNConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *pollingTUNConn) SetWriteDeadline(t time.Time) error { return nil }
+
+var _ net.Conn = (*pollingTUNConn)(nil)
+
+// getPortRangeBounds parses a port range string and returns start/end bounds
+// Supports formats: "995" (single port), "47000-47100" (range)
+// Returns (0, 0) on error
+func getPortRangeBounds(portRange string) (start, end int) {
+	if portRange == "" {
+		return 0, 0
+	}
+
+	portRange = strings.TrimSpace(portRange)
+
+	// Check for range format: "47000-47100"
+	if idx := strings.Index(portRange, "-"); idx > 0 {
+		startStr := strings.TrimSpace(portRange[:idx])
+		endStr := strings.TrimSpace(portRange[idx+1:])
+
+		fmt.Sscanf(startStr, "%d", &start)
+		fmt.Sscanf(endStr, "%d", &end)
+
+		// Validate
+		if start < 1 || start > 65535 || end < 1 || end > 65535 {
+			return 0, 0
+		}
+		if start > end {
+			start, end = end, start
+		}
+		return start, end
+	}
+
+	// Single port - return same start and end
+	fmt.Sscanf(portRange, "%d", &start)
+	if start < 1 || start > 65535 {
+		return 0, 0
+	}
+	return start, start
+}
+
+var _ http.Handler = nil // Import check
